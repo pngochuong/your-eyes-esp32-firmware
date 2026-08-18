@@ -176,6 +176,17 @@ void normalizeRecording(size_t bytes) {
 static float   g_hpX = 0.0f, g_hpY = 0.0f;
 static int32_t g_runPeak = 0;      // dinh CUA CA DOAN DA THAY, chi tang
 static int     g_gain    = 1;      // suy ra tu g_runPeak, nen chi giam
+static size_t  g_seen    = 0;      // so mau da di qua, de bo qua doan mic on dinh
+
+// 🔴 Bo qua 100 ms dau khi do dinh. INMP441 nha ra vai mau BAO HOA ngay sau khi
+// bat kenh I2S. Chung khong phai tin hieu, nhung dinh chay thi chi tang: mot
+// mau -32768 lot vao la he so bi ghim o 1 suot ca cau, va ban thu di len server
+// nho nguyen nhu chua qua khuech dai. Da do duoc dung nhu vay tren mot ban thu
+// khong co ai noi gi: "Dinh truoc khuech dai = 32768, he so = 1".
+//
+// Van LOC va van khuech dai doan nay nhu binh thuong — chi khong cho no du phan
+// vao con so dinh.
+#define DSP_SETTLE_SAMP  (SR / 10)
 
 // He so nham dua dinh ve khoang 8000/32767 (-12 dBFS) — giong
 // normalizeRecording(). Chua tran de mot tieng go bat ngo khong lam ca cau
@@ -191,6 +202,7 @@ void dspStreamBegin() {
   g_hpX = g_hpY = 0.0f;
   g_runPeak = 0;
   g_gain    = 1;
+  g_seen    = 0;
 }
 
 void dspStreamPrep(size_t from, size_t count) {
@@ -207,8 +219,10 @@ void dspStreamPrep(size_t from, size_t count) {
     int16_t v = y > 32767.0f ? 32767 : (y < -32768.0f ? -32768 : (int16_t)y);
     recBuf[i] = v;
     int32_t a = v < 0 ? -(int32_t)v : (int32_t)v;
-    if (a > blockPeak) blockPeak = a;
+    if (a > blockPeak && g_seen + (i - from) >= (size_t)DSP_SETTLE_SAMP)
+      blockPeak = a;
   }
+  g_seen += count;
 
   // 🔴 Cap nhat dinh chay TRUOC khi khuech dai mieng nay, khong phai sau. Neu
   // cap nhat sau thi mot mieng to bat ngo se duoc nhan bang he so cu (tinh cho

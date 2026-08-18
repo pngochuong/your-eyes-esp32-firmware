@@ -54,7 +54,7 @@ static const int NET_TIMEOUT_MS = 60000;
 // Socket luon dung NET_TIMEOUT_MS.
 static const int NET_DNS_MS      = 3000;   // phan giai ten mien, chi lam 1 lan luc khoi dong
 static const int NET_CONNECT_MS  = 9000;   // ngan sach CHO task mang xong mot buoc
-static const int NET_HANDSHAKE_S = 8;      // 🔴 setHandshakeTimeout() tinh bang GIAY
+static const int NET_HANDSHAKE_S = 15;      // 🔴 setHandshakeTimeout() tinh bang GIAY
 
 // ---- Giu phien TLS song de dung lai cho lan bam sau
 //

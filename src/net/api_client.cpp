@@ -281,6 +281,26 @@ static bool openTls() {
   return true;
 }
 
+bool apiWarmUp() {
+  if (!g_haveIp) return false;
+
+  unsigned long t = millis();
+  if (!openTls()) {
+    Serial.printf("Bat tay TLS truoc KHONG xong (%lu ms) — se thu lai o lan bam nut\n",
+                  millis() - t);
+    return false;
+  }
+
+  // 🔴 Danh dau dung lai duoc NGAY o day. Khong co hai dong nay thi phien vua
+  // mo van bi openTls() cua lan bam dau tien coi la "khong dung lai duoc" va
+  // bat tay lai tu dau — tuc quay ve dung cai loi vua sua.
+  g_reusable = true;
+  g_aliveAt  = millis();
+  Serial.printf("Bat tay TLS truoc XONG (%lu ms) — giu phien cho lan bam dau\n",
+                millis() - t);
+  return true;
+}
+
 // Doi mot con tro duoc giao toi, hoac bo cuoc. Tra ve false khi het gio / bi
 // huy — luc do ca lan gui coi nhu hong.
 static bool waitFor(const uint8_t *volatile *p, unsigned long timeoutMs) {

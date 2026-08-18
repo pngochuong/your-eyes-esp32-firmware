@@ -74,6 +74,16 @@ void setup() {
     if (wifiProvenServerIp(srvIp)) apiSetAddress(srvIp);
     else                           apiResolve(true);
 
+    // 🔴 Bat tay TLS NGAY BAY GIO, truoc startCameraServer(). Hai ly do, ca hai
+    // deu do duoc:
+    //   - RAM noi luc nay thoang nhat ca phien. mbedtls can ~45 KB LIEN, va sau
+    //     khi httpd + audio da lay phan cua chung thi khoi lien lon nhat tut tu
+    //     147 KB xuong 106 KB.
+    //   - Phien nay duoc GIU lai (TLS_KEEPALIVE_MS), nen lan bam nut dau tien
+    //     khong phai bat tay — chang dat nhat cua ca luong bang 0 ngay tu dau,
+    //     chu khong phai tu lan bam thu hai.
+    apiWarmUp();
+
     startCameraServer();
 
     Serial.println();
@@ -114,6 +124,7 @@ void loop() {
       IPAddress srvIp;
       if (wifiProvenServerIp(srvIp)) apiSetAddress(srvIp);
       else                           apiResolve(true);
+      apiWarmUp();
 
       if (!serverStarted) {
         // Lan dau vao duoc mang sau khi setup() that bai: gio moi co IP

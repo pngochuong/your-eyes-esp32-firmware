@@ -76,6 +76,24 @@ void apiSetAddress(IPAddress ip);
 // Da co dia chi trong tay chua.
 bool apiHaveAddress();
 
+// ============================================================================
+// Bat tay TLS truoc, luc khoi dong, roi GIU phien lai
+// ============================================================================
+// 🔴 Truoc kia wifiConnect() tu bat tay mot lan de "chung minh duong di" roi
+// stop() ngay. Do that (2026-08-19, hotspot iPhone): lan bat tay do XONG trong
+// 5496 ms, nhung vut di; toi luc bam nut, bat tay lai tren DUNG dia chi ay
+// chet o 8059 ms voi mbedtls -1. Tuc phep thu khong he du bao duoc lan that —
+// no chi tieu mat mot lan bat tay dang le dung duoc.
+//
+// Ham nay lam dung viec do nhung khong vut: bat tay xong thi danh dau phien la
+// dung lai duoc, va apiBegin() o lan bam dau tien di thang vao ghi byte. Bat
+// tay la chang dat nhat con lai sau khi DNS da duoc nho san (do duoc 1321 toi
+// 5496 ms), nen day la chang dang tiet kiem nhat.
+//
+// Tra ve true khi phien dang mo. Hong thi khong sao — apiBegin() se tu bat tay
+// o lan bam nut.
+bool apiWarmUp();
+
 // In dia chi dang nho + tuoi cua no. Chi phuc vu lenh chan doan.
 void apiPrintAddress();
 

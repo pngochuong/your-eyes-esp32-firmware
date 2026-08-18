@@ -1,3 +1,4 @@
+#include <esp_heap_caps.h>
 #include "wifi_manager.h"
 
 #include <WiFi.h>
@@ -125,7 +126,25 @@ static bool tlsReachableOn(IPAddress ip, unsigned long timeoutSec) {
   c.setHandshakeTimeout(timeoutSec);
 
   bool ok = c.connect(ip, API_PORT, API_HOST, nullptr, nullptr, nullptr);
-  if (ok) c.stop();
+
+  // 🔴 Hong thi phai in RA ma loi, dung de lai mot chu "hong".
+  //
+  // mbedtls co in ly do bang log_e(), nhung ban dung nay khong dat DebugLevel
+  // nen moi dong do bi bien dich BO. Khong hoi lastError() thi "TLS hong
+  // (0 ms)" va "TLS hong (8003 ms)" nhin nhu cung mot loi, trong khi 0 ms la
+  // hong TRUOC khi goi tin roi board (het bo nho, khong mo noi socket) con
+  // 8003 ms la het gio cho ben kia tra loi — hai huong sua nguoc nhau.
+  if (!ok) {
+    char msg[128] = {0};
+    int  e = c.lastError(msg, sizeof(msg));
+    Serial.printf("  mbedtls %d (-0x%04X) %s | heap %u B, khoi lien lon nhat %u B\n",
+                  e, (unsigned)(-e), msg,
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_largest_free_block(
+                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+
+  c.stop();
   return ok;
 }
 
@@ -162,20 +181,29 @@ static bool resolveFamily(int family, IPAddress &out, unsigned long &ms) {
 // "IPv4 hong" roi bat IPv6 du phong — trong khi that ra IPv4 chua bao gio
 // duoc thu, chi la khong co ai phan giai ten mien ho no.
 //
-// Chi ghi vao o CON TRONG, khong dam vao o DHCP da dat: may chu cua nha mang
-// gan hon va thuong nhanh hon, chi can co nguoi do dinh khi no im lang.
-static void dnsAddFallback() {
+// 🔴 Dat resolver cong cong len o 0, DAY resolver cua DHCP xuong o 2 — khong
+// phai chi nhet vao cho trong nhu truoc.
+//
+// Ban truoc chi lap o trong, va do that tren hotspot iPhone "Huong"
+// (2026-08-19) danh sach ra dung nhu mong doi:
+//     [0]=172.20.10.1  [1]=8.8.8.8  [2]=1.1.1.1
+// nhung hoi ban ghi A van chet o 18000 roi 15000 ms. lwip hoi o 0 truoc va
+// thu lai vai luot moi chuyen sang o ke — nen mot resolver do chung o o 0
+// nuot tron ca ngan sach thoi gian, hai o sau gan nhu khong bao gio toi luot.
+// Cung ten mien do, hoi tu PC tren DUNG hotspot ay: 17 ms.
+//
+// Doi lai gi: mat kha nang phan giai ten trong mang LAN. Board nay chi phan
+// giai DUY NHAT mot ten mien cong cong (API_HOST), nen khong mat gi that.
+static void dnsSetPublicFirst() {
+  const ip_addr_t *dhcp = dns_getserver(0);
+  ip_addr_t keep = (dhcp && !ip_addr_isany(dhcp)) ? *dhcp : *IP_ADDR_ANY;
+
   ip_addr_t g, cf;
   IP_ADDR4(&g,  8, 8, 8, 8);
   IP_ADDR4(&cf, 1, 1, 1, 1);
-  const ip_addr_t *want[2] = { &g, &cf };
-
-  int wi = 0;
-  for (int i = 0; i < DNS_MAX_SERVERS && wi < 2; i++) {
-    const ip_addr_t *cur = dns_getserver(i);
-    if (cur && !ip_addr_isany(cur)) continue;    // o nay dang co nguoi
-    dns_setserver(i, want[wi++]);
-  }
+  dns_setserver(0, &g);
+  dns_setserver(1, &cf);
+  if (!ip_addr_isany(&keep) && DNS_MAX_SERVERS > 2) dns_setserver(2, &keep);
 
   Serial.print("May chu DNS dang dung:");
   for (int i = 0; i < DNS_MAX_SERVERS; i++) {
@@ -349,95 +377,22 @@ bool wifiConnect(unsigned long timeoutMs) {
   // 🔴 Thu HAI lan truoc khi bo sang IPv6. Truot oan mot lan la tra gia dat:
   // bat IPv6 len roi thi khong go duoc trong phien nay, ma tren mang chi co
   // IPv4 dinh tuyen (router gia dinh) thi moi ket noi sau do deu chet o 15 s.
-  // Lan dau hay truot vi duong 4G/DNS con nguoi; lan hai da am nen sat thuc te.
-  // 🔴 Nhet DNS IPv4 du phong TRUOC khi thu. Khong co buoc nay thi tren
-  // hotspot chi cap resolver IPv6, phep thu duoi day khong bao gio phan giai
-  // noi ban ghi A va se ket luan sai la "IPv4 hong".
-  dnsAddFallback();
-
-  bool v4Ok = false;
-  unsigned long tV4 = millis();
-
-  for (int lan = 1; lan <= 2 && !v4Ok; lan++) {
-    IPAddress     v4;
-    unsigned long dnsMs = 0;
-
-    // Tach hai chang. Truoc day gop lam mot nen khi hong khong ai biet la
-    // "khong phan giai duoc" hay "phan giai duoc nhung goi tin khong ra toi
-    // noi" — ma hai cai sua o hai dau khac han nhau.
-    if (!resolveFamily(AF_INET, v4, dnsMs)) {
-      Serial.printf("Thu IPv4 lan %d: khong co ban ghi A (%lu ms)\n", lan, dnsMs);
-      continue;
-    }
-
-    unsigned long t = millis();
-    v4Ok = tlsReachableOn(v4, NET_HANDSHAKE_S);
-    Serial.printf("Thu IPv4 lan %d: DNS %s (%lu ms), TLS %s (%lu ms)\n",
-                  lan, v4.toString().c_str(), dnsMs,
-                  v4Ok ? "OK" : "hong", millis() - t);
-
-    // Giu lai dia chi VUA bat tay duoc — day la thu duy nhat co bang chung.
-    if (v4Ok) { g_provenIp = v4; g_haveProven = true; }
-  }
-
-  if (v4Ok) {
-    Serial.printf("Duong ra: IPv4 (bat tay TLS mat %lu ms). Khong bat IPv6.\n",
-                  millis() - tV4);
-    return true;
-  }
-
-  Serial.printf("IPv4 khong ra duoc server (hong ca 2 lan, %lu ms) — bat IPv6 du phong\n",
-                millis() - tV4);
-
-  // 🔴 Bat co IPv6 KHONG du — phai noi lai mang. Router chi quang ba SLAAC
-  // luc thiet bi moi lien ket; bat co sau do thi phai ngoi cho toi luot quang
-  // ba dinh ky, co the lau hon ca phut. Da do that: bat co xong cho 6 giay,
-  // "IPv6 toan cuc: KHONG CO", trong khi noi lai thi co dia chi trong ~2 giay.
-  WiFi.STA.enableIPv6(true);
-  Serial.println("Noi lai mang de xin dia chi IPv6 (SLAAC chi chay luc lien ket)");
-
-  WiFi.disconnect(false, false);
-  delay(300);
-
-  if (!beginAndWait(timeoutMs)) {
-    Serial.println("Noi lai that bai — mat mang luon");
-    Serial.printf("Ly do driver bao: %d — %s\n",
-                  g_lastReason, wifiReasonText(g_lastReason));
-    return false;
-  }
-
-  // Dia chi IPv6 toan cuc do router quang ba (SLAAC), mat them vai giay sau
-  // khi lien ket len. Cho co roi moi bao — tren mang IPv6-only thi day moi
-  // la dia chi duy nhat ra duoc internet, thieu no la hong ca chuoi.
-  const unsigned long v6Start = millis();
-  while (!WiFi.STA.hasGlobalIPv6() && millis() - v6Start < 8000) {
-    delay(200);
-  }
-
-  if (WiFi.STA.hasGlobalIPv6()) {
-    Serial.print("IPv6 toan cuc: ");
-    Serial.println(WiFi.STA.globalIPv6());
-
-    // 🔴 Nhanh nay cung phai bat tay THAT roi moi dam giu dia chi. Truoc day
-    // no chi bao "co IPv6" roi de api_client tu phan giai — dung cai bay da
-    // dinh o nhanh IPv4: dia chi phan giai duoc chua chac la dia chi di duoc.
-    IPAddress     v6;
-    unsigned long dnsMs = 0;
-    if (resolveFamily(AF_INET6, v6, dnsMs)) {
-      unsigned long t  = millis();
-      bool          ok = tlsReachableOn(v6, NET_HANDSHAKE_S);
-      Serial.printf("Thu IPv6: DNS %s (%lu ms), TLS %s (%lu ms)\n",
-                    v6.toString().c_str(), dnsMs,
-                    ok ? "OK" : "hong", millis() - t);
-      if (ok) { g_provenIp = v6; g_haveProven = true; }
-    } else {
-      Serial.printf("Thu IPv6: khong co ban ghi AAAA (%lu ms)\n", dnsMs);
-    }
-  } else {
-    Serial.println("IPv6 toan cuc: KHONG CO — va IPv4 cung khong ra duoc.");
-    Serial.println("  Mang nay chua noi duoc internet: kiem tra router, hoac");
-    Serial.println("  WiFi co trang dang nhap (captive portal) chua bam qua.");
-  }
+  // ===========================================================================
+  // 🔴 KHONG bat tay TLS o day nua. Chi dat DNS roi tra ve.
+  // ===========================================================================
+  // Ban truoc bat tay tron ven mot lan de "chung minh duong di", roi stop()
+  // ngay va giao lai moi dia chi. Do that (2026-08-19, hotspot iPhone): lan
+  // bat tay ay XONG trong 5496 ms roi bi vut; toi luc bam nut, bat tay lai
+  // tren DUNG dia chi do chet o 8059 ms voi mbedtls -1. Phep thu khong du bao
+  // duoc lan that — no chi tieu mat mot lan bat tay dang le dung duoc, va moi
+  // lan bat tay bo di con lam phan manh RAM noi (mbedtls xin ~45 KB LIEN).
+  //
+  // Gio viec do api_client lam bang apiWarmUp(): cung mot lan bat tay, nhung
+  // GIU phien lai cho lan bam nut dau tien. Mot lan bat tay cho ca phien, thay
+  // vi mot lan bo di cong mot lan that.
+  //
+  // Chuoi day du nam o file .ino: wifiConnect() -> apiResolve() -> apiWarmUp().
+  dnsSetPublicFirst();
   return true;
 }
 
