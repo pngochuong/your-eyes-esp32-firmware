@@ -17,7 +17,7 @@ Một lần bấm nút trả lời được các câu hỏi kiểu *"trước m�
 ## 1. Luồng chạy
 
 ```
-setup()                      VisionCare.ino
+setup()                      your-eyes-esp32-firmware.ino
   cameraStart()              khong co camera -> dung han, khong dung web server
   webLedBegin()
   wifiConnect(30s)           mat Wi-Fi van di tiep (nut/mic/loa phai song)
@@ -113,7 +113,7 @@ Mốc kích thước để so sánh — lệch nhiều là có gì đó vừa đ
 
 | File gốc | Nội dung |
 |---|---|
-| [VisionCare.ino](VisionCare.ino) | **SSID + mật khẩu Wi-Fi** (dòng 37–38), rồi `setup()` + `loop()` |
+| [your-eyes-esp32-firmware.ino](your-eyes-esp32-firmware.ino) | **SSID + mật khẩu Wi-Fi** (dòng 37–38), rồi `setup()` + `loop()` |
 | [app_config.h](app_config.h) | endpoint API, timeout mạng, chân GPIO, XCLK, thông số thu âm |
 | [board_config.h](board_config.h) | chọn model camera (`CAMERA_MODEL_ESP32S3_EYE`) |
 | [camera_pins.h](camera_pins.h) | sơ đồ chân camera theo model |
@@ -162,7 +162,7 @@ Mốc kích thước để so sánh — lệch nhiều là có gì đó vừa đ
 
 | Muốn đổi | File |
 |---|---|
-| Wi-Fi SSID / mật khẩu | [VisionCare.ino:37](VisionCare.ino#L37) |
+| Wi-Fi SSID / mật khẩu | [your-eyes-esp32-firmware.ino:37](your-eyes-esp32-firmware.ino#L37) |
 | Endpoint API, timeout mạng | [app_config.h:23-50](app_config.h#L23-L50) |
 | Chân GPIO I2S / nút / đèn | [app_config.h:76-101](app_config.h#L76-L101) |
 | Tần số thu, trần thời gian thu | [app_config.h:109-113](app_config.h#L109-L113) |

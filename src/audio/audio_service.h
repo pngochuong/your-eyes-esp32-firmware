@@ -18,4 +18,16 @@
 // Tra ve false neu khong khoi dong duoc — camera van chay binh thuong.
 bool startAudio();
 
+// Chay tron mot lan hoi dap nhu vua bam nut, nhung khong can cham vao nut.
+//
+// Ly do ton tai: moi phep do end-to-end truoc day deu phai co nguoi dung ngoi
+// canh board de bam. Chan doan qua Serial tu xa vi the khong cham toi duoc
+// chang nang nhat (gui anh + am len server) — dung chang hay hong nhat. Ham
+// nay di ĐUNG trinh tu cua audioTask, khong phai duong tat, nen so lieu no in
+// ra so sanh truc tiep duoc voi mot lan bam that.
+//
+// Goi tu consolePoll(), tuc dang o trong task "audio" — khong duoc goi tu
+// task khac, vi I2S va bo dem thu deu thuoc ve task nay.
+void audioSimulatePress(unsigned long holdMs);
+
 #endif  // AUDIO_SERVICE_H

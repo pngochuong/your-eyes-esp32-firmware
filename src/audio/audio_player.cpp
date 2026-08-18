@@ -15,7 +15,13 @@
 //   dong dien dinh lon = rail 5 V sut = ca chip lan amp cung u u. Ha xuong
 //   70% cat dinh dong gan mot nua ma tai nghe chi nho di chut.
 //   Con re: ha tiep 60 → 50. Het re nhung nho qua: nang len 85.
-#define PLAY_GAIN_PCT   70
+//
+// 🔴 Da ha 70 → 55 (2026-08-18): o 70 nguoi dung van bao "hoi re" khi phat cau
+// tra loi tu server. Nguyen nhan khong phai cat tran so — do that mot lan
+// phat: dinh 14889/32767, so mau cham tran = 0. Tuc la meo nam o phan ANALOG,
+// tu dinh dong lam sut rail 5 V, dung nhu doan o tren. Cat tran so thi ha bao
+// nhieu cung vo ich, con ha dinh dong thi an ngay.
+#define PLAY_GAIN_PCT   55
 
 // Vuot bien do len/xuong o dau va cuoi cau noi. Khong co doan nay thi
 // mau dau tien nhay tu 0 len bien do that trong 1/16000 giay — mang loa

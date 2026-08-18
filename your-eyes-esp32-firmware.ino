@@ -21,6 +21,7 @@
 #include "src/audio/audio_service.h"
 #include "src/camera/camera_device.h"
 #include "src/camera/camera_tuning.h"
+#include "src/net/api_client.h"
 #include "src/net/wifi_manager.h"
 #include "src/web/web_led.h"
 #include "src/web/web_server.h"
@@ -60,6 +61,19 @@ void setup() {
   bool wifiOk = wifiConnect(30000);
 
   if (wifiOk) {
+    // 🔴 Lay dia chi ma wifiConnect() DA bat tay TLS tron ven toi, chu khong
+    // hoi DNS lai. Do that (2026-08-18): cung mot ten mien, dia chi
+    // 104.21.67.134 bat tay xong trong 3212 ms, con 172.67.176.233 bat tay TCP
+    // xong nhung TLS thi treo vinh vien — 15 giay cung khong xong. Cloudflare
+    // tra nhieu IP va khong phai duong nao cung cho qua goi full-size. Hoi lai
+    // DNS la tu nguyen doi mot dia chi da co bang chung lay mot dia chi chua
+    // biet gi.
+    //
+    // apiResolve() chi con la duong lui khi phep thu kia khong ket luan duoc.
+    IPAddress srvIp;
+    if (wifiProvenServerIp(srvIp)) apiSetAddress(srvIp);
+    else                           apiResolve(true);
+
     startCameraServer();
 
     Serial.println();
@@ -94,15 +108,27 @@ void loop() {
     Serial.println("Mat WiFi — dang ket noi lai...");
     WiFi.disconnect();
 
-    if (wifiConnect(20000) && !serverStarted) {
-      // Lan dau vao duoc mang sau khi setup() that bai: gio moi co IP
-      // de web server bind vao.
-      startCameraServer();
-      serverStarted = true;
+    if (wifiConnect(20000)) {
+      // Dia chi cu thuoc ve mang cu. Lay lai dia chi vua duoc chung minh tren
+      // mang MOI, dung doi toi lan bam nut moi phat hien ra.
+      IPAddress srvIp;
+      if (wifiProvenServerIp(srvIp)) apiSetAddress(srvIp);
+      else                           apiResolve(true);
 
-      Serial.print("Mo trinh duyet: http://");
-      Serial.println(WiFi.localIP());
+      if (!serverStarted) {
+        // Lan dau vao duoc mang sau khi setup() that bai: gio moi co IP
+        // de web server bind vao.
+        startCameraServer();
+        serverStarted = true;
+
+        Serial.print("Mo trinh duyet: http://");
+        Serial.println(WiFi.localIP());
+      }
     }
+  } else {
+    // Mang van tot: chi lam moi dia chi khi no da cu. apiResolve() tu bo qua
+    // neu con han, nen goi moi 10 giay o day khong ton gi.
+    apiResolve(false);
   }
 
   delay(10000);

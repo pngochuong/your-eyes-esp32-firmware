@@ -4,7 +4,7 @@ Mỗi giai đoạn **chỉ thêm đúng một linh kiện**, test xong mới san
 
 Bổ sung cho [HUONG_DAN_LAP_RAP.md](HUONG_DAN_LAP_RAP.md) (tra cứu pinout/cảnh báo) và [HUONG_DAN_TEST_CAM.md](HUONG_DAN_TEST_CAM.md) (chi tiết camera).
 
-> 📌 **Đọc trước khi tra code.** Tài liệu này kể lại quá trình dựng máy theo từng giai đoạn, nên các đoạn code bên dưới là bản **ở thời điểm đó**, không phải bản cuối. Sau GĐ 6, toàn bộ mã đã được tách thành module trong `src/` — xem [Giai đoạn 7](#giai-đoạn-7--tách-module) ở cuối để biết hàm nào giờ nằm ở file nào. Sketch chính giờ tên `VisionCare.ino`, không còn là `CameraWebServer.ino`.
+> 📌 **Đọc trước khi tra code.** Tài liệu này kể lại quá trình dựng máy theo từng giai đoạn, nên các đoạn code bên dưới là bản **ở thời điểm đó**, không phải bản cuối. Sau GĐ 6, toàn bộ mã đã được tách thành module trong `src/` — xem [Giai đoạn 7](#giai-đoạn-7--tách-module) ở cuối để biết hàm nào giờ nằm ở file nào. Sketch chính giờ tên `your-eyes-esp32-firmware.ino` (từng là `VisionCare.ino`, trước nữa là `CameraWebServer.ino`).
 
 ---
 
@@ -483,7 +483,7 @@ Cuối cùng mới thêm code audio vào sketch camera.
 
 Không đụng vào `loop()`. Audio chạy trong **task FreeRTOS riêng, ghim vào core 1**, để web server và camera giữ nguyên hành vi cũ. Nếu nhét I2S vào `loop()`, mỗi lần thu 3 giây là stream đứng hình 3 giây.
 
-Giữ nguyên sketch chính gần như hoàn toàn — chỉ thêm 2 dòng. Toàn bộ phần audio nằm ở tab mới. (Lúc này file còn tên `CameraWebServer.ino`; nay là [VisionCare.ino](VisionCare.ino).)
+Giữ nguyên sketch chính gần như hoàn toàn — chỉ thêm 2 dòng. Toàn bộ phần audio nằm ở tab mới. (Lúc này file còn tên `CameraWebServer.ino`; nay là [your-eyes-esp32-firmware.ino](your-eyes-esp32-firmware.ino).)
 
 ### File mới: `audio.ino`
 
@@ -978,7 +978,7 @@ GĐ 7 **không đổi một dòng logic nào**, chỉ chia lại: mỗi `.cpp` m
 Gốc thư mục = những gì bạn sửa. `src/` = mã.
 
 ```
-VisionCare.ino      tên + mật khẩu Wi-Fi, rồi setup() + loop()
+your-eyes-esp32-firmware.ino   tên + mật khẩu Wi-Fi, rồi setup() + loop()
 app_config.h        endpoint API, timeout mạng, chân GPIO, tần số thu
 board_config.h      chọn model camera
 camera_pins.h       sơ đồ chân camera

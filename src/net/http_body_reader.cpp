@@ -9,6 +9,7 @@ void bodyInit(BodyReader &b, WiFiClientSecure *c, bool chunked, long clen) {
   b.eof = false;
   b.lineLen = 0;
   b.line[0] = 0;
+  b.backLen = 0;
 }
 
 // Doc TOI DA `max` byte, tra ve ngay voi nhung gi dang co.
@@ -16,7 +17,20 @@ void bodyInit(BodyReader &b, WiFiClientSecure *c, bool chunked, long clen) {
 //   = 0 : chua co gi luc nay, goi lai sau
 //   < 0 : het than (binh thuong) hoac dut ket noi
 int bodyRead(BodyReader &b, uint8_t *dst, size_t max) {
-  if (b.eof || max == 0) return -1;
+  if (max == 0) return -1;
+
+  // Tra lai truoc nhung byte da doc trom. Dat TRUOC ca phep thu b.eof: byte
+  // nam trong tay roi thi luong het hay chua khong lien quan.
+  if (b.backLen > 0) {
+    size_t n = b.backLen;
+    if (n > max) n = max;
+    memcpy(dst, b.back, n);
+    b.backLen -= (uint8_t)n;
+    if (b.backLen > 0) memmove(b.back, b.back + n, b.backLen);
+    return (int)n;
+  }
+
+  if (b.eof) return -1;
 
   // Chunked: het mieng cu thi doc dong kich thuoc mieng moi.
   //
@@ -72,5 +86,13 @@ bool bodyReadExact(BodyReader &b, uint8_t *dst, size_t len) {
     if (millis() - t0 > FIRST_AUDIO_MS) return false;
     vTaskDelay(5 / portTICK_PERIOD_MS);
   }
+  return true;
+}
+
+bool bodySniff(BodyReader &b, uint8_t *dst, size_t len) {
+  if (len > sizeof(b.back) || b.backLen > 0) return false;
+  if (!bodyReadExact(b, dst, len)) return false;
+  memcpy(b.back, dst, len);
+  b.backLen = (uint8_t)len;
   return true;
 }

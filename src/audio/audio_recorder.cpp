@@ -11,7 +11,7 @@
 // ============================================================================
 // Doc tung mieng nho (~32 ms) de vong lap con kip thay nut da nha.
 // Tra ve so byte PCM thu duoc.
-size_t recordWhileHeld() {
+size_t recordWhileHeld(RecChunkFn onChunk) {
   const size_t CHUNK = 512 * sizeof(int16_t);
   size_t got = 0, n;
   unsigned long t0 = millis();
@@ -34,6 +34,9 @@ size_t recordWhileHeld() {
       Serial.printf("LOI read: %s\n", esp_err_to_name(e));
       break;
     }
+    // Giao mieng vua doc NGAY, truoc khi doc mieng tiep. Vong lap nay la
+    // nhip co san cua duong thu — khong can them task nao.
+    if (onChunk && n) onChunk(got / sizeof(int16_t), n / sizeof(int16_t));
     got += n;
   }
   Serial.printf("Thu %lu ms, %u byte\n", millis() - t0, (unsigned)got);
@@ -51,6 +54,35 @@ size_t recordWhileHeld() {
   if (got >= recMaxSamp * sizeof(int16_t))
     Serial.printf("(cham tran %u giay — phan nha nut sau do bi cat)\n",
                   (unsigned)(recMaxSamp / SR));
+  return got;
+}
+
+// ============================================================================
+// Thu dung mot khoang thoi gian dinh truoc
+// ============================================================================
+// Ban sao cua recordWhileHeld() voi dieu kien dung doi tu "nut con giu" thanh
+// "chua het gio". Khong gop chung mot ham voi tham so co/khong dung nut: vong
+// lap tren la duong chay THAT cua nguoi dung, khong nen them nhanh re chi vi
+// viec chan doan.
+size_t recordFixed(unsigned long ms, RecChunkFn onChunk) {
+  const size_t CHUNK = 512 * sizeof(int16_t);
+  size_t got = 0, n;
+  unsigned long t0 = millis();
+
+  while (millis() - t0 < ms && got < recMaxSamp * sizeof(int16_t)) {
+    size_t want = recMaxSamp * sizeof(int16_t) - got;
+    if (want > CHUNK) want = CHUNK;
+    esp_err_t e = i2s_channel_read(i2sRx, (uint8_t *)recBuf + got, want, &n,
+                                   200 / portTICK_PERIOD_MS);
+    if (e == ESP_ERR_TIMEOUT) continue;
+    if (e != ESP_OK) {
+      Serial.printf("LOI read: %s\n", esp_err_to_name(e));
+      break;
+    }
+    if (onChunk && n) onChunk(got / sizeof(int16_t), n / sizeof(int16_t));
+    got += n;
+  }
+  Serial.printf("Thu %lu ms, %u byte\n", millis() - t0, (unsigned)got);
   return got;
 }
 
