@@ -70,7 +70,12 @@ static const int NET_HANDSHAKE_S = 15;      // 🔴 setHandshakeTimeout() tinh b
 // Con byte nao chua doc thi no se bi doc thanh dong dau tien cua tra loi lan
 // sau — hai luong lech nhau vinh vien, va trieu chung la "tu nhien tra loi
 // sai bet tu lan bam thu hai".
-static const unsigned long TLS_KEEPALIVE_MS = 8UL * 60UL * 1000UL;
+// 🔴 60 giay, khong phai 8 phut. Do that (2026-08-19): phien mo 141 giay truoc
+// van bao connected() = true nhung da chet — board ghi tron request vao do roi
+// nhan duoc dong trang thai RONG. Cloudflare cat ket noi ranh som hon nhieu so
+// voi 8 phut. netRun() co nhanh gui lai mot lan cho ca nay, nhung tranh duoc
+// van hon: mot lan gui lai la mot lan day lai tron ca anh lan tieng.
+static const unsigned long TLS_KEEPALIVE_MS = 60UL * 1000UL;
 
 // Bao lau thi coi nhu dia chi da phan giai la cu va di hoi lai. Cloudflare doi
 // IP kha thuong xuyen, nhung ta con co duong tu phan giai lai khi ket noi

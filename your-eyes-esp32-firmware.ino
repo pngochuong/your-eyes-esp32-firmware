@@ -35,8 +35,8 @@
 //
 // Ten mang phan biet chu hoa chu thuong va tinh ca dau cach. Mang mo (khong
 // mat khau) thi de mat khau la chuoi rong "".
-const char* WIFI_SSID     = "Huong";
-const char* WIFI_PASSWORD = "20061029";
+const char* WIFI_SSID     = "UIT Public";
+const char* WIFI_PASSWORD = "";
 // ===========================================================================
 
 void setup() {

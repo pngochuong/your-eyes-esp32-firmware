@@ -230,7 +230,8 @@ bool apiResolve(bool force) {
 // SNI de biet dang hoi site nao; connect(IPAddress, port) khong gui SNI nen se
 // bi tu choi bat tay. Nap chong 6 tham so duoi day la duong duy nhat vua bo
 // duoc DNS vua giu duoc SNI.
-static bool openTls() {
+static bool openTls(bool *reused) {
+  if (reused) *reused = false;
   if (!g_haveIp) return false;
   IPAddress ip = g_ip;
 
@@ -240,6 +241,7 @@ static bool openTls() {
       millis() - g_aliveAt < TLS_KEEPALIVE_MS) {
     Serial.printf("  Dung lai phien TLS cu (mo %lu giay truoc) — bo qua bat tay\n",
                   (millis() - g_aliveAt) / 1000);
+    if (reused) *reused = true;
     return true;
   }
   if (g_reusable)
@@ -285,7 +287,7 @@ bool apiWarmUp() {
   if (!g_haveIp) return false;
 
   unsigned long t = millis();
-  if (!openTls()) {
+  if (!openTls(nullptr)) {
     Serial.printf("Bat tay TLS truoc KHONG xong (%lu ms) — se thu lai o lan bam nut\n",
                   millis() - t);
     return false;
@@ -374,16 +376,9 @@ static bool readHeaders() {
 // ============================================================================
 // Chay tron mot lan gui. Tra ve false o bat ky chang nao hong — nguoi goi lo
 // viec dong socket va dat trang thai, nen o day chi can `return false`.
-static bool netRun() {
-  // --- Buoc 1: bat tay TLS. Chay trong luc dang chup anh.
-  //
-  // Thu het danh sach dang nho; van hong thi hoi lai DNS roi thu het lan nua.
-  // 🔴 Vong hai la bat buoc, khong phai cho chac an: do that, ca danh sach
-  // dang nho co the da cu — Cloudflare doi IP va bo cu ngung nhan ket noi.
-  // Lan hoi lai tra ve dia chi khac han va bat tay duoc ngay.
-  g_st = ST_CONNECT;
-  if (!openTls()) return false;
-
+// Gui tron mot lan tren mot phien TLS DA MO. Tach rieng khoi netRun() de
+// goi lai duoc khi phien giu lai hoa ra da chet — xem ghi chu o netRun().
+static bool sendOnce() {
   // --- Buoc 2: doi anh, roi day header + phan anh.
   // Tran doi = thoi gian chup mot loat, rong tay. Qua han nghia la ben kia da
   // bo cuoc ma quen bao.
@@ -466,7 +461,18 @@ static bool netRun() {
     size_t have = g_audFill;
     bool   fin  = g_audDone;      // doc SAU `have` — xem ghi chu ben duoi
 
-    if (have > sent) {
+    // 🔴 Doi cho gom du MIN_CHUNK roi hay ghi, tru khi da thu xong.
+    //
+    // Bo nen sinh ra mot khoi 256 byte moi 32 ms. Ghi thang tung khoi thi moi
+    // khoi thanh mot ban ghi TLS rieng, va writeChunk() lai la BA lan write()
+    // (tieu de chunk, du lieu, CRLF) — voi TCP_NODELAY bat san thi do la ba
+    // goi tin nho cho 256 byte du lieu. Do duoc: anh day 15.5 KB/s trong khi
+    // tieng chi 3.8 KB/s tren cung mot socket, cung mot luc.
+    //
+    // Gom 4 KB thi phan dat them phai day sau khi nha nut nhieu nhat la 4 KB
+    // (~0.4 giay o 10 KB/s), van trong ngan sach, ma so goi tin giam 16 lan.
+    const size_t MIN_CHUNK = 4096;
+    if (have > sent && (have - sent >= MIN_CHUNK || fin)) {
       // Gom moi thu da co vao MOT mieng chunked. Mieng cang to thi 8 byte
       // tieu de chunk cang chia deu ra nhieu — va tren duong cham thi mot
       // vong nhu vay thuong da gom san vai khoi.
@@ -507,6 +513,41 @@ static bool netRun() {
   // --- Buoc 4: doc header tra ve. Chang nay la thoi gian SERVER nghi.
   g_st = ST_READ_HDR;
   return readHeaders();
+}
+
+static bool netRun() {
+  g_st = ST_CONNECT;
+
+  bool reused = false;
+  if (!openTls(&reused)) return false;
+
+  if (sendOnce()) return true;
+
+  // ===========================================================================
+  // Phien giu lai hoa ra da chet: bat tay MOI va gui lai, DUNG mot lan.
+  // ===========================================================================
+  // 🔴 Day KHONG phai cai "vong thu lai" bi cam o dau file. Cai bi cam la thu
+  // lai mot duong dang hong — cho them cung khong xanh len, chi de nguoi dung
+  // ngoi cho im lang. Cai nay nguoc lai: lan dau that bai vi ta tu chon dung
+  // lai mot socket cu, tuc ta gay ra, va lan hai di tren mot socket hoan toan
+  // moi nen no la mot phep thu KHAC han.
+  //
+  // Do that (2026-08-19, UIT Public): phien mo 141 giay truoc, connected() van
+  // bao true, board ghi tron ca anh lan tieng vao do roi nhan duoc dong trang
+  // thai RONG. Khong co nhanh nay thi moi lan bam sau mot quang nghi deu hong,
+  // va nguoi dung khong the biet vi sao.
+  //
+  // An toan vi luc nay ban thu da xong: g_aud/g_audFill/g_audDone deu la gia
+  // tri cuoi cung, g_img van con song, nen gui lai chi la day byte lan nua.
+  // Khong dung cho phien vua bat tay moi — hong o do la hong that.
+  if (!reused) return false;
+
+  Serial.println("Phien giu lai da chet — bat tay moi va gui lai mot lan");
+  g_reusable = false;
+  g_client.stop();
+
+  if (!openTls(nullptr)) return false;
+  return sendOnce();
 }
 
 static void netTask(void *) {
