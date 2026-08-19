@@ -21,7 +21,23 @@
 // phat: dinh 14889/32767, so mau cham tran = 0. Tuc la meo nam o phan ANALOG,
 // tu dinh dong lam sut rail 5 V, dung nhu doan o tren. Cat tran so thi ha bao
 // nhieu cung vo ich, con ha dinh dong thi an ngay.
-#define PLAY_GAIN_PCT   55
+#define PLAY_GAIN_PCT   45
+
+// PLAY_HPF_HZ: cat moi thu duoi tan so nay TRUOC khi day ra loa.
+//
+// 🔴 Day moi la nut an tieng re, khong phai PLAY_GAIN_PCT. Loa mini 3 W 8 ohm
+// khong tai tao noi duoi khoang 300 Hz — mang loa chi phap phong het bien do
+// ma khong ra am, va chinh cai phap phong do la tieng "re". Giong noi tieng
+// Viet co tan so co ban 100-200 Hz, tuc phan lon nang luong dang do vao dai ma
+// loa khong dung duoc, lai con an mat bien do cua dai nghe duoc.
+//
+// 180 Hz vi dai thoai chuan bat dau tu 300 Hz: cat toi day khong mat mot chut
+// nao cua do ro tieng, ma bo duoc gan het phan lam mang loa qua tai.
+//
+// Muon to hon ma khong re: HA gain 9 dB cua MAX98357A truoc (noi chan GAIN len
+// Vdd = 6 dB, hoac qua tro 100k len Vdd = 3 dB — de trong la 9 dB), roi nang
+// PLAY_GAIN_PCT len. Duong do giu duoc so bit, con ha so thi mat bit that.
+#define PLAY_HPF_HZ     180
 
 // Vuot bien do len/xuong o dau va cuoi cau noi. Khong co doan nay thi
 // mau dau tien nhay tu 0 len bien do that trong 1/16000 giay — mang loa
@@ -85,7 +101,7 @@ static const size_t MIN_REPLY = 512 * 1024;       // muc lui khi PSRAM khong du
 // Trang thai nan tieng, giu giua cac mieng. Ban nap-tron nhin thay ca cau;
 // ban nay khong, nen moi thu phai co trang thai.
 static struct {
-  float   hpX, hpY;
+  float   hpX, hpY, hpA;      // hpA tinh tu tan so lay mau, xem scondReset()
   size_t  done;
   size_t  fade;
   int32_t peak;
@@ -94,6 +110,13 @@ static struct {
 
 static void scondReset(uint32_t rate) {
   scond.hpX = scond.hpY = 0.0f;
+
+  // 🔴 He so PHAI tinh tu tan so that, khong duoc de hang so. Server tra 16 kHz
+  // nhung tung tra 48 kHz, va cung mot he so o hai tan so la hai tan so cat
+  // khac nhau gap ba lan — o 48 kHz thi 180 Hz se thanh 540 Hz va nuot mat
+  // phan than cua giong noi.
+  scond.hpA = rate ? expf(-2.0f * (float)M_PI * PLAY_HPF_HZ / (float)rate)
+                   : 0.93f;
   scond.done = 0;
   scond.fade = (size_t)rate * FADE_MS / 1000;
   if (scond.fade == 0) scond.fade = 1;
@@ -105,7 +128,7 @@ static void scondReset(uint32_t rate) {
 // biet cau con dai bao nhieu. Chi vuot xuong khi da biet diem ket thuc — day
 // la ly do vong lap ben duoi giu lai mot doan cuoi chua xu ly.
 static void scondChunk(int16_t *p, size_t n, size_t left) {
-  const float A = 0.999f;        // thong cao ~2.5 Hz: chi cat mot chieu
+  const float A = scond.hpA;     // thong cao PLAY_HPF_HZ, xem scondReset()
 
   for (size_t i = 0; i < n; i++) {
     float x = (float)p[i];
