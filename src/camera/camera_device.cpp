@@ -36,7 +36,7 @@
 // doc. Chi ha xuong SVGA/VGA khi buoc phai chay tren duong vai KB/s, va biet
 // ro la doi lai chu nho se khong doc duoc nua.
 static framesize_t camFrameSize  = FRAMESIZE_HD;    // 1280 x 720
-static int         camJpegQuality = 10;
+static int         camJpegQuality = 18;
 
 // esp_camera_init() thanh cong hay chua.
 static bool cameraReady = false;

@@ -126,6 +126,8 @@ Mốc so sánh kích thước — lệch nhiều so với nó thì có gì đó 
 | **+ `perf_probe`** (đo tại chỗ, 2026-08-15) | 1249727 byte (39%) | 70792 byte (21%) |
 | **+ ADPCM hai chiều** (2026-08-15) | **1252187 byte (39%)** | **70800 byte (21%)** |
 | **+ chọn đường phát theo byte thật** (2026-08-16) | **1252939 byte (39%)** | **70800 byte (21%)** |
+| **+ pipeline 4 bước, đẩy ảnh sớm, cue** (2026-08-18) | 1291647 byte (41%) | 77192 byte (23%) |
+| **+ ADPCM theo luồng, bỏ IPv6, gom miếng 4 KB** (2026-08-19) | **1290595 byte (41%)** | **77328 byte (23%)** |
 
 Tra tên tuỳ chọn khác của board: `arduino-cli board details -b esp32:esp32:esp32s3`.
 
@@ -142,6 +144,7 @@ Tra tên tuỳ chọn khác của board: `arduino-cli board details -b esp32:esp
 | [board_config.h](board_config.h) | chọn model camera (`CAMERA_MODEL_ESP32S3_EYE`) |
 | [camera_pins.h](camera_pins.h) | sơ đồ chân camera theo model |
 | [HUONG_DAN_LAP_TUNG_BUOC.md](HUONG_DAN_LAP_TUNG_BUOC.md) | nhật ký bring-up 8 giai đoạn + số liệu đo thực tế |
+| [GHI_CHU_PHIEN_2026-08-19.md](GHI_CHU_PHIEN_2026-08-19.md) | ADPCM theo luồng, gỡ IPv6, các con số đo được và việc còn lại |
 | [HUONG_DAN_SERVER.md](HUONG_DAN_SERVER.md) | **hợp đồng board ↔ server**: byte gửi lên, 4 định dạng nhận về, ngưỡng tốc độ nhả, các mốc timeout, lệnh ffmpeg/curl |
 | [BangTomTat.csv](BangTomTat.csv) | bảng linh kiện đầy đủ |
 | [README.md](README.md) | giới thiệu project |
@@ -235,7 +238,8 @@ Tra tên tuỳ chọn khác của board: `arduino-cli board details -b esp32:esp
 - **Buffer lớn xin một lần lúc khởi động**, không xin theo lần bấm nút — PSRAM phân mảnh sẽ làm cấp phát thất bại giữa chừng và người dùng chỉ thấy máy im lặng.
 - **`startAudio()` gọi SAU `startCameraServer()`** để camera + httpd chiếm RAM trước; phần PSRAM còn lại mới là phần audio thật sự được dùng.
 - **Ảnh mờ vì PHÒNG TỐI, không phải cấu hình sai.** Mọi thiết lập phần mềm chỉ dịch cân giữa nhoè-chuyển-động và nhiễu-hạt, không tạo thêm ánh sáng. Lối thoát duy nhất: lắp đèn vào `FLASH_LED_PIN`.
-- **Bật IPv6 lên là mất quyền chọn đường — nên `wifiConnect()` thử IPv4 trước, hỏng mới bật IPv6.** `NetworkManager::hostByName()` của core 3.3.x có đoạn workaround: hễ interface mang địa chỉ IPv6 toàn cục thì nó hỏi AAAA trước và dùng luôn, **không bao giờ thử IPv4**. Mà `enableIPv6(false)` chỉ xoá cờ `WANT_IP6`, **không thu hồi địa chỉ đã cấp** — lỡ bật rồi thì phải nối lại mạng mới gỡ được. Đã trả giá cho cả hai chiều: hotspot điện thoại **bắt buộc** phải có IPv6 (IPv4 không ra internet), còn router `Ngoc Phat` quảng bá IPv6 nhưng nhà mạng không định tuyến → bật IPv6 lên là mọi kết nối chết ở đúng 15 s dù IPv4 vẫn tốt. Không chọn cứng bên nào được.
+- **🔴 Nhánh IPv6 ĐÃ BỊ BỎ HẲN khỏi `wifiConnect()` (2026-08-19).** Đo từ PC nối vào đúng hotspot đang dùng: IPv4 bắt tay TLS 0.19 s, IPv6 không bao giờ nối nổi TCP (chết ở 21 s). Cả hai mạng thiết bị này chạy trên đều vậy — IPv6 chưa cứu được lần nào mà lần nào cũng phá. Muốn dựng lại thì điều kiện phải là *"phân giải được bản ghi A NHƯNG không bắt tay nổi"*, tuyệt đối không phải *"IPv4 không làm được gì"*: cả hai lần rơi vào nhánh đó đều chỉ vì resolver dở vài chục giây. Ghi chú cũ bên dưới giữ lại vì lý do vẫn đúng:
+- **Bật IPv6 lên là mất quyền chọn đường.** `NetworkManager::hostByName()` của core 3.3.x có đoạn workaround: hễ interface mang địa chỉ IPv6 toàn cục thì nó hỏi AAAA trước và dùng luôn, **không bao giờ thử IPv4**. Mà `enableIPv6(false)` chỉ xoá cờ `WANT_IP6`, **không thu hồi địa chỉ đã cấp** — lỡ bật rồi thì phải nối lại mạng mới gỡ được. Đã trả giá cho cả hai chiều: hotspot điện thoại **bắt buộc** phải có IPv6 (IPv4 không ra internet), còn router `Ngoc Phat` quảng bá IPv6 nhưng nhà mạng không định tuyến → bật IPv6 lên là mọi kết nối chết ở đúng 15 s dù IPv4 vẫn tốt. Không chọn cứng bên nào được.
 - **Đừng dùng `hostByName()` để kết luận "IPv4 hỏng"** — vì lý do trên, nó chưa từng thử IPv4. Muốn tách hai đường phải ép `ai_family` bằng tay qua `lwip_getaddrinfo()`, đúng như `probeFamily()` trong `wifi_manager.cpp`.
 - **Bắt tay TCP xong KHÔNG có nghĩa là đường đó dùng được.** Đo thật trên hotspot 4G: `TCP 443 OK (1340 ms)` nhưng TLS trên đúng socket đó chết sau **124 giây**. Nhà mạng có middlebox/CGNAT tự trả SYN-ACK thay server. Mọi phép thử dùng để *quyết định* đường đi phải bắt tay **TLS trọn vẹn** (`tlsReachable()`), không được dừng ở TCP.
 - **`setHandshakeTimeout()` là bắt buộc, đơn vị GIÂY.** Tham số timeout của `connect()` chỉ chặn ở mức socket; bắt tay TLS có đồng hồ riêng và rất dài. Thiếu nó đã đo được **124304 ms cho một lần "timeout 15 giây"** — nhìn ngoài giống hệt treo máy.
@@ -253,9 +257,13 @@ POST https://api.visioncare-host.uk/process        (443, TLS)
 Content-Type: multipart/form-data
 Accept: audio/wav;codec=ima_adpcm, audio/mpeg, audio/wav   (ưu tiên giảm dần)
   field "image" — capture.jpg,  image/jpeg
-  field "audio" — record.wav,   audio/wav
-                  🔴 IMA/DVI ADPCM 4-bit mono 16 kHz (fmt tag 0x0011),
-                  block align 256 B = 505 mẫu. KHÔNG còn PCM 16-bit.
+  field "audio" — record.adpcm, audio/x-adpcm-ima; rate=16000; channels=1; block=256
+                  🔴 IMA/DVI ADPCM 4-bit mono 16 kHz, THÔ — KHÔNG có header
+                  RIFF. Header WAV phải đi trước dữ liệu nhưng ba trường của
+                  nó (RIFF size, data size, số mẫu `fact`) chỉ biết khi thu
+                  xong, tức buộc mọi byte phải đợi nhả nút. Bỏ header đi thì
+                  board nén và đẩy từng khối 256 B ngay trong lúc đang nói.
+                  Server dựng lại header: `adpcm.ensure_wav()`.
 
 Trả về 200 — board nuốt được cả bốn, xếp theo thứ tự nên dùng:
   audio/wav   fmt 0x0011  IMA ADPCM 4-bit mono   ← nhanh nhất, nên dùng
