@@ -10,12 +10,15 @@
 //
 //   recBuf   — ban thu tu mic, cung la cho playTone()/distortionTest() muon
 //              de dung song thu.
+//   sendBuf  — file WAV IMA ADPCM dung san de POST (header + du lieu nen).
 //   stageBuf — bo dem trung gian giua mang va loa khi phat.
 // ============================================================================
 #include <Arduino.h>
 
 extern int16_t *recBuf;      // buffer thu am
 extern size_t   recMaxSamp;  // tran so mau thu duoc mot lan
+extern uint8_t *sendBuf;     // WAV ADPCM dung san de gui
+extern size_t   sendCap;     // suc chua cua sendBuf, tinh bang byte
 extern uint8_t *stageBuf;    // bo dem phat
 extern size_t   stageCap;    // suc chua cua stageBuf, tinh bang byte
 

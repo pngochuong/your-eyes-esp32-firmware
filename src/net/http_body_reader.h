@@ -18,6 +18,8 @@ struct BodyReader {
   bool    eof;
   char    line[24];   // dem gom dong kich thuoc mieng, giu giua cac lan goi
   uint8_t lineLen;
+  uint8_t back[8];    // byte da doc trom roi tra lai luong, xem bodySniff()
+  uint8_t backLen;
 };
 
 void bodyInit(BodyReader &b, WiFiClientSecure *c, bool chunked, long clen);
@@ -30,5 +32,12 @@ int bodyRead(BodyReader &b, uint8_t *dst, size_t max);
 
 // Doc dung `len` byte, cho toi khi du. Chi dung cho header WAV (vai chuc byte).
 bool bodyReadExact(BodyReader &b, uint8_t *dst, size_t len);
+
+// Nhin `len` byte dau cua than roi TRA LAI vao luong — nguoi doc sau van thay
+// chung nhu chua ai dong toi. Toi da bang sizeof(BodyReader::back).
+//
+// Co de chon duong phat theo NOI DUNG chu khong theo HTTP header: header co
+// the mo ta sai, bon byte dau cua file thi khong.
+bool bodySniff(BodyReader &b, uint8_t *dst, size_t len);
 
 #endif  // HTTP_BODY_READER_H

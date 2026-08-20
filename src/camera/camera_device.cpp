@@ -10,8 +10,33 @@
 //
 // Hai bien la runtime chu khong phai constexpr vi nhanh khong co PSRAM
 // ben duoi se ha chung xuong truoc khi esp_camera_init() chay.
-static framesize_t camFrameSize  = FRAMESIZE_UXGA;  // 1600 x 1200
-static int         camJpegQuality = 10;
+// 🔴 720p chu khong con UXGA. Ly do la DUONG TRUYEN, khong phai cam bien.
+// Do that tren hotspot 4G: duong day len chi 5.9-9 KB/s. Buc UXGA 1600x1200
+// o muc nen 10 ra 127 KB — mot minh no mat 14 giay de len toi server. HD
+// 1280x720 chi con 0.92 megapixel so voi 1.92, ra khoang 55-65 KB, tuc mot
+// nua thoi gian; phan con lai da duoc giau vao luc nguoi dung dang noi (xem
+// apiPushImage trong audio_service).
+//
+// Van du de doc chu: 1280 diem ngang tren khung hinh la 1280 diem, khong doi
+// theo do phan giai doc. Chu bi mat la chu von da qua nho o UXGA roi.
+//
+// OV2640 khong len duoc 1080p — UXGA 1600x1200 la tran cua no, va FRAMESIZE
+// _FHD 1920x1080 nam ngoai kha nang cam bien nay.
+//
+// Doi mot dong duoi day la doi ca canh nang. Byte do THAT o muc nen 10, va
+// thoi gian tinh tren hai duong da do:
+//
+//   framesize      byte anh    @ 9 KB/s (hotspot 4G)   @ FTTH
+//   UXGA 1600x1200  ~127 000        14.1 s             ~0.3 s
+//   HD   1280x720    ~67 000         7.4 s             ~0.2 s   <- dang dung
+//   SVGA  800x600    ~30 000         3.3 s             ~0.1 s
+//   VGA   640x480    ~15 000         1.7 s             ~0.1 s
+//
+// Tren duong nhanh thi con so nao cung khong dang ke — cu de HD cho OCR de
+// doc. Chi ha xuong SVGA/VGA khi buoc phai chay tren duong vai KB/s, va biet
+// ro la doi lai chu nho se khong doc duoc nua.
+static framesize_t camFrameSize  = FRAMESIZE_HD;    // 1280 x 720
+static int         camJpegQuality = 18;
 
 // esp_camera_init() thanh cong hay chua.
 static bool cameraReady = false;
@@ -25,6 +50,7 @@ const char *cameraFrameSizeName(framesize_t size) {
   switch (size) {
     case FRAMESIZE_UXGA: return "UXGA 1600 x 1200";
     case FRAMESIZE_SXGA: return "SXGA 1280 x 1024";
+    case FRAMESIZE_HD:   return "HD 1280 x 720";
     case FRAMESIZE_XGA:  return "XGA 1024 x 768";
     case FRAMESIZE_SVGA: return "SVGA 800 x 600";
     case FRAMESIZE_VGA:  return "VGA 640 x 480";

@@ -13,7 +13,8 @@
 #include <Arduino.h>
 
 // ---------------------------------------------------------------------- WiFi
-// Ten mang va mat khau KHONG nam o day nua — chung o ngay dau VisionCare.ino,
+// Ten mang va mat khau KHONG nam o day nua — chung o ngay dau sketch chinh
+// (your-eyes-esp32-firmware.ino),
 // la file dau tien mo len khi nap chuong trinh. Doi mang la viec lam thuong
 // xuyen nhat, khong nen bat nguoi dung phai lan sang file khac.
 // Khai bao dung o src/net/wifi_manager.h.
@@ -26,7 +27,60 @@
 
 // Do thuc te: server xu ly rat lau moi tra byte dau tien. Moi timeout duoi day
 // phai rong hon con so do, neu khong se ngat ngay truoc khi co ket qua.
-static const int NET_TIMEOUT_MS = 90000;
+static const int NET_TIMEOUT_MS = 60000;
+
+// ---- Ba con so DUNG DAU: chung quyet dinh bao lau thi biet la mang hong.
+//
+// 🔴 Tach han khoi NET_TIMEOUT_MS o tren. Hai nhom nay do hai thu khac nhau:
+// nhom nay do "co voi toi server duoc khong" — cau tra loi phai den NHANH de
+// con bao cho nguoi dung bam lai; NET_TIMEOUT_MS do "server nghi xong chua" —
+// cai do buoc phai rong vi server that su cham.
+//
+// Do that tren hotspot Redmi (Viettel, 2026-08-18): DNS 3.7-14 s, bat tay TCP
+// toi Cloudflare 7.4 s. Nen 9 giay la nguong vua du cho mang cham that, va du
+// gat de mot lan hong khong bat nguoi dung dung do nua phut.
+// Gat het muc con AN TOAN — nhung "an toan" o day la con so do duoc, khong
+// phai con so mong muon.
+//
+// 🔴 Bat tay TLS THANH CONG da do duoc: 1321, 3212, 3321, **5117** ms. Nen dat
+// tran 5 giay la loai oan chinh cai duong dang chay duoc — da xay ra dung nhu
+// vay mot lan. 8 giay la muc gat nhat con bao duoc lan 5117 ms, va van du som
+// de keu tieng bip cho nguoi dung bam lai.
+//
+// 🔴 NET_HANDSHAKE_S chan RIENG lan bat tay (tang mbedtls). KHONG duoc dung
+// con so gat nay lam timeout cua socket: start_ssl_client() nap timeout cua
+// socket ngay luc connect va no tro thanh tran cho MOI lan ghi/doc sau do. Da
+// tra gia: dat 5000 thi lan ghi anh chet o dung "5004 ms" du duong van tot.
+// Socket luon dung NET_TIMEOUT_MS.
+static const int NET_DNS_MS      = 3000;   // phan giai ten mien, chi lam 1 lan luc khoi dong
+static const int NET_CONNECT_MS  = 9000;   // ngan sach CHO task mang xong mot buoc
+static const int NET_HANDSHAKE_S = 15;      // 🔴 setHandshakeTimeout() tinh bang GIAY
+
+// ---- Giu phien TLS song de dung lai cho lan bam sau
+//
+// 🔴 Bat tay TLS do duoc 3212 ms tren FTTH — chang dat nhat cua ca luong sau
+// khi DNS da duoc nho san. Nhung mot phien TLS dung duoc cho NHIEU request
+// lien tiep neu ca hai ben khong dong ket noi, nen tu lan bam thu hai tro di
+// chang do co the bang 0.
+//
+// 8 phut: Cloudflare giu ket noi keep-alive rong khoang 900 giay, nen 480 giay
+// con du bien de khong bao gio ngoi doi mot socket da bi ben kia dong.
+//
+// 🔴 Dieu kien BAT BUOC de dung lai: than cua lan truoc phai duoc doc HET.
+// Con byte nao chua doc thi no se bi doc thanh dong dau tien cua tra loi lan
+// sau — hai luong lech nhau vinh vien, va trieu chung la "tu nhien tra loi
+// sai bet tu lan bam thu hai".
+// 🔴 60 giay, khong phai 8 phut. Do that (2026-08-19): phien mo 141 giay truoc
+// van bao connected() = true nhung da chet — board ghi tron request vao do roi
+// nhan duoc dong trang thai RONG. Cloudflare cat ket noi ranh som hon nhieu so
+// voi 8 phut. netRun() co nhanh gui lai mot lan cho ca nay, nhung tranh duoc
+// van hon: mot lan gui lai la mot lan day lai tron ca anh lan tieng.
+static const unsigned long TLS_KEEPALIVE_MS = 60UL * 1000UL;
+
+// Bao lau thi coi nhu dia chi da phan giai la cu va di hoi lai. Cloudflare doi
+// IP kha thuong xuyen, nhung ta con co duong tu phan giai lai khi ket noi
+// hong, nen con so nay chi la luoi do thu hai.
+static const unsigned long DNS_CACHE_MS = 10UL * 60UL * 1000UL;
 
 // Hai hang muc cho khac han nhau, khong duoc dung chung mot con so:
 //
@@ -39,7 +93,10 @@ static const int NET_TIMEOUT_MS = 90000;
 //     server dang do du lieu ra; im qua lau la xong hoac hong. Con phai co
 //     con so nay vi server KHONG gui mieng ket thuc "0\r\n\r\n" va cung khong
 //     dong ket noi — khong co no thi ESP32 ngoi cho vinh vien sau byte cuoi.
-static const int FIRST_AUDIO_MS = 180000;
+// Do that: server nghi ~40 giay. 60 giay chua 20 giay du phong, va cat truoc
+// moc 100 giay ma Cloudflare tu ngat (loi 524) — nho vay khi hong ta biet la
+// server cham that chu khong phai Cloudflare vua dong tay giua chung.
+static const int FIRST_AUDIO_MS = 60000;
 
 // 🔴 30 giay, khong phai 8. Da do that: server sinh tieng theo TUNG CAU, va
 // khoang nghi giua hai cau co the vuot 8 giay khi TTS cham. De 8 giay thi
@@ -105,6 +162,11 @@ static const int BODY_GAP_MS = 30000;
 // duoc thanh tieng lach tach deu deu. Luc dang phat loa thi khong can
 // truyen gi, nen ha xuong khong mat mat gi. Dat 0 de tat tinh nang nay.
 #define LOWER_WIFI_TX   1
+
+// Am luong ra loa KHONG nam o day — no la nut van rieng cua tung khoi phat:
+//   cau tra loi tu server : PLAY_GAIN_PCT trong src/audio/audio_player.cpp
+//   hai tieng bao tai cho : CUE_GAIN      trong src/audio/audio_cues.cpp
+// Hai cho do deu co ghi san cach chinh khi loa re.
 
 // ---------------------------------------------------------------- Thu am
 static const uint32_t SR      = 16000;   // tan so thu cua mic
