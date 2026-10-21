@@ -32,4 +32,32 @@ int         cameraJpegQuality();
 // Ten hien thi cua do phan giai, chi dung cho log.
 const char *cameraFrameSizeName(framesize_t size);
 
+// ============================================================================
+// Doi che do chup luc dang chay — cho live (OCR / chi duong) cua server
+// ============================================================================
+// Server ra lenh `cam` (vga 5 fps, qvga 8 fps...) va `capture` (uxga), trong
+// khi anh cua mot luot hoi van can HD. Mot camera, hai nguoi dung, nen:
+//   - ai chup cung phai cameraLock() truoc, cameraUnlock() sau;
+//   - ai can do phan giai nao thi tu cameraSetMode() ngay sau khi khoa.
+// Doi giua chung khong lam hong ai: nguoi kia khoa lai se tu dat lai che do.
+
+// Khoa de quy: cung mot task khoa long nhau duoc.
+void cameraLock();
+void cameraUnlock();
+
+// Dat do phan giai + muc nen. Lon hon co da cap phat luc init thi bi kep lai
+// (frame buffer khong chua noi) va in mot dong. Tra ve do phan giai THAT da dat.
+framesize_t cameraSetMode(framesize_t fs, int quality);
+
+// Quay ve che do cua anh luot hoi (cameraFrameSize / cameraJpegQuality).
+void cameraUseDefault();
+
+// Doc rong x cao THAT tu marker SOF cua mot file JPEG. false neu khong doc
+// duoc. Khac fb->width: cai do la kich thuoc DA CAU HINH, khong phai du lieu.
+bool jpegSize(const uint8_t *p, size_t len, uint16_t *w, uint16_t *h);
+
+// "qvga", "vga", "svga", "hd", "sxga", "uxga"... -> framesize_t.
+// Khong nhan ra thi tra `fallback`.
+framesize_t cameraParseSize(const char *name, framesize_t fallback);
+
 #endif  // CAMERA_DEVICE_H

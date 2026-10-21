@@ -1,14 +1,13 @@
 #include "audio_buffers.h"
 
 #include "adpcm_codec.h"
-#include "audio_format.h"
 #include "../util/mem_alloc.h"
 #include "../../app_config.h"
 
-// Suc chua bo dem trung gian. Phai du lon de chua TRON mot cau tra loi, vi
-// khi server day cham hon toc do phat thi cach duy nhat khong bi dut la nhan
-// het roi moi phat. 40 giay o 16 kHz mono = 1.28 MB PSRAM — con 7 MB, thoai mai.
-#define STAGE_MS        40000
+// Suc chua hang phat (play_queue), tinh bang byte ADPCM. Hang giu tieng NEN,
+// 8.1 KB/s, nen 512 KB = ~64 giay tieng — du cho mot cau tra loi dai cong vai
+// cau result-* xep sau, ma chi ton 512 KB PSRAM.
+#define STAGE_BYTES     (512 * 1024)
 
 // Tran thu am tinh luc chay, vi con so phu thuoc co PSRAM hay khong.
 // camera_device ha camera xuong SVGA/DRAM khi thieu PSRAM; audio phai lui
@@ -35,14 +34,12 @@ bool audioBuffersAlloc() {
     return false;
   }
 
-  // File WAV ADPCM dung san de POST. Nen 4:1 nen no chi bang mot phan tu
-  // recBuf — 10 giay o 16 kHz: 320 KB PCM -> 81 KB.
+  // ADPCM tho cua ban thu, task mang day len thanh khung 0x03 trong luc dang
+  // thu. Nen 4:1 nen no chi bang mot phan tu recBuf — 10 giay: 320 KB -> 81 KB.
   //
-  // Xin rieng chu khong nen DE CHONG len recBuf. Nen tai cho la an toan ve
-  // mat con tro (dau ra luon chay sau dau vao), nhung no PHA ban thu goc —
-  // ma ban thu goc con dung cho lenh chan doan, va khi gui hong thi khong
-  // con gi de thu lai. 81 KB PSRAM khong dang de doi lay hai thu do.
-  sendCap  = WAV_ADPCM_HDR + adpcmEncodedBytes(recMaxSamp);
+  // Xin rieng chu khong nen DE CHONG len recBuf: nen tai cho PHA ban thu goc,
+  // ma ban thu goc con dung cho lenh chan doan.
+  sendCap  = adpcmEncodedBytes(recMaxSamp);
   sendBuf  = (uint8_t *)bigAlloc(sendCap);
   if (!sendBuf) {
     Serial.printf("Khong xin duoc %u byte bo dem gui\n", (unsigned)sendCap);
@@ -50,13 +47,10 @@ bool audioBuffersAlloc() {
     return false;
   }
 
-  // Bo dem trung gian cho phat theo luong. Tinh o tan so mic; server tra tan
-  // so cao hon thi so giay dem ngan lai tuong ung, van du dung.
-  stageCap = (size_t)SR * STAGE_MS / 1000 * sizeof(int16_t);
-  stageCap &= ~(size_t)3;                 // giu boi so 4 cho khung stereo
+  stageCap = STAGE_BYTES;
   stageBuf = (uint8_t *)bigAlloc(stageCap);
   if (!stageBuf) {
-    Serial.printf("Khong xin duoc %u byte bo dem phat — ha STAGE_MS xuong\n",
+    Serial.printf("Khong xin duoc %u byte hang phat — ha STAGE_BYTES xuong\n",
                   (unsigned)stageCap);
     audioBuffersFree();
     return false;

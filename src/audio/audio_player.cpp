@@ -3,132 +3,82 @@
 #include <math.h>
 #include <WiFi.h>
 
+#include "adpcm_codec.h"
 #include "audio_buffers.h"
+#include "audio_cues.h"
 #include "audio_i2s.h"
+#include "play_queue.h"
 #include "../../app_config.h"
 
 // ------------------------------------------------------------ chinh loa re
-// Ba nut de van khi loa re. Chinh o day, khong phai trong vong phat ben duoi.
-//
 // PLAY_GAIN_PCT: bien do phat, tinh theo % goc.
-//   Khong co tu loc nguon thi day la nut quan trong nhat. Bien do to =
-//   dong dien dinh lon = rail 5 V sut = ca chip lan amp cung u u. Ha xuong
-//   70% cat dinh dong gan mot nua ma tai nghe chi nho di chut.
-//   Con re: ha tiep 60 → 50. Het re nhung nho qua: nang len 85.
 //
-// 🔴 Da ha 70 → 55 (2026-08-18): o 70 nguoi dung van bao "hoi re" khi phat cau
-// tra loi tu server. Nguyen nhan khong phai cat tran so — do that mot lan
-// phat: dinh 14889/32767, so mau cham tran = 0. Tuc la meo nam o phan ANALOG,
-// tu dinh dong lam sut rail 5 V, dung nhu doan o tren. Cat tran so thi ha bao
-// nhieu cung vo ich, con ha dinh dong thi an ngay.
+// 🔴 Da ha 70 → 55 → 45 (2026-08-18): o 70 nguoi dung van bao "hoi re". Do that
+// mot lan phat: dinh 14889/32767, so mau cham tran = 0. Tuc la meo nam o phan
+// ANALOG, tu dinh dong lam sut rail 5 V. Cat tran so thi ha bao nhieu cung vo
+// ich, con ha dinh dong thi an ngay.
 #define PLAY_GAIN_PCT   45
 
 // PLAY_HPF_HZ: cat moi thu duoi tan so nay TRUOC khi day ra loa.
 //
 // 🔴 Day moi la nut an tieng re, khong phai PLAY_GAIN_PCT. Loa mini 3 W 8 ohm
 // khong tai tao noi duoi khoang 300 Hz — mang loa chi phap phong het bien do
-// ma khong ra am, va chinh cai phap phong do la tieng "re". Giong noi tieng
-// Viet co tan so co ban 100-200 Hz, tuc phan lon nang luong dang do vao dai ma
-// loa khong dung duoc, lai con an mat bien do cua dai nghe duoc.
-//
-// 180 Hz vi dai thoai chuan bat dau tu 300 Hz: cat toi day khong mat mot chut
-// nao cua do ro tieng, ma bo duoc gan het phan lam mang loa qua tai.
+// ma khong ra am, va chinh cai phap phong do la tieng "re".
 //
 // Muon to hon ma khong re: HA gain 9 dB cua MAX98357A truoc (noi chan GAIN len
-// Vdd = 6 dB, hoac qua tro 100k len Vdd = 3 dB — de trong la 9 dB), roi nang
-// PLAY_GAIN_PCT len. Duong do giu duoc so bit, con ha so thi mat bit that.
+// Vdd = 6 dB), roi nang PLAY_GAIN_PCT len.
 #define PLAY_HPF_HZ     180
 
-// Vuot bien do len/xuong o dau va cuoi cau noi. Khong co doan nay thi
-// mau dau tien nhay tu 0 len bien do that trong 1/16000 giay — mang loa
-// giat mot cai, tai nghe thanh tieng "tach".
+// Vuot bien do o dau va cuoi moi doan tieng. Khong co thi mang loa giat mot
+// cai, tai nghe thanh tieng "tach".
 #define FADE_MS         8
 
-// Bom im lang truoc va sau khi phat. DMA cua I2S van quay khi het du lieu;
-// khong bom thi no lap lai mieng dem cu, ra tieng u hoac lap bap cuoi cau.
+// Bom im lang sau khi phat, de day not doan duoi ra khoi DMA va dua mang loa
+// ve 0 thay vi lap lai mieng dem cu.
 #define FLUSH_MS        40
 
-// Tran file am tra ve. Nap tron vao PSRAM roi moi phat.
-//
-// Da thu phat theo luong (vua nhan vua phat) va BO. Ly do: server khong nha
-// deu — co lan ca 198 KB ve trong 10 giay gay 4 lan hut, co lan chi ve 3.5 KB
-// roi dung han 160 giay. Phat theo luong chi hon khi nguon day deu; khong deu
-// thi no bien mot cau lien mach thanh mot chuoi tieng giat. Nap tron cho do
-// tre cao hon nhung KHONG BAO GIO giat, va do la thu nguoi dung nghe thay.
-static const size_t MAX_REPLY = 2 * 1024 * 1024;  // 2 MB
-static const size_t MIN_REPLY = 512 * 1024;       // muc lui khi PSRAM khong du
+// Preroll mac dinh khi server khong noi (cau cua live khong co `reply`).
+// Spec: `reply.audio.preroll_s` = 0.2 s.
+#define PREROLL_DEFAULT_MS  200
 
-// ------------------------------------------------------- phat theo luong
-// Server tra am thanh dan chu khong doi xong ca file. Phat dan thi nghe duoc
-// som hon nhieu, nhung doi lai: mang nghen mot nhip la loa hut tieng.
-//
-// Hai yeu cau nay keo nguoc chieu nhau:
-//   dem NHIEU  -> khong hut, nhung tieng ra cham
-//   dem IT     -> tieng ra nhanh, nhung mang nghen mot nhip la dut
-// Nen KHONG chon mot con so co dinh, ma chia lam ba:
-//
-//   PREBUF_MS   — dem lan dau, quyet dinh DO TRE. De nho.
-//   REFILL_*    — dem nap lai sau khi hut. TU LON DAN moi lan hut, nen mang
-//                 tot thi khong ai phai tra gia, mang xau thi no tu chuyen
-//                 sang che do an toan sau dung mot lan giat.
-//   DANGER_MS   — muc bao dong. Con it hon the la vuot bien do XUONG truoc
-//                 khi het sach, roi vuot LEN khi co lai.
-//
-// Cho cuoi cung moi la mau chot: thu lam nguoi ta NGHE THAY khoang dut khong
-// phai la su im lang, ma la cai GAY DOT NGOT o hai dau no. Vuot muot hai dau
-// thi tai nhan ra day la mot quang nghi, khong phai loi.
-#define PREBUF_MS        400    // muc toi thieu de bat dau do
+// Cho du preroll toi da bay lau. Qua han thi phat voi nhung gi dang co — mot
+// cau ngan hon preroll thi se khong bao gio du.
+#define PREROLL_MAX_WAIT_MS 1500
 
-// 🔴 Phai DO DU LAU roi moi quyet dinh nguong. Da tung khong co con so nay:
-// bo giai ma MP3 xa mot cum ngay khi co du lieu nen, cham nguong sau 39 ms,
-// va uoc luong toc do o thoi diem do la vo nghia — no chon nguong nho nhat
-// roi hut ngay sau do.
-//
-// WARMUP bo qua cum xa dau tien; do tu sau moc do toi MEASURE moi ra toc do
-// on dinh that cua nguon.
-#define WARMUP_MS        300
-#define MEASURE_MS       900
-#define REFILL_START_MS  800    // nap lai sau lan hut dau tien
-#define REFILL_STEP_MS   400    // moi lan hut tiep lai cong them
-#define REFILL_MAX_MS   2500    // tran
-#define DANGER_MS         40    // duoi muc nay thi bat dau vuot xuong
+// 🔴 Bao lau khong co khoi moi thi coi la het doan va vuot xuong.
+// DMA sau 8 x 480 khung = 240 ms, va i2s_channel_write() chan khi DMA day — tuc
+// ngay sau moi lan ghi DMA con >= 200 ms tieng. Cho 120 ms van con thua ~80 ms
+// truoc khi loa that su can, nen mot khoi den tre vai chuc ms KHONG lam dut
+// tieng; qua 120 ms moi chiu la het cau.
+#define STARVE_MS       120
 
-// Moi lan day sang I2S bao nhieu byte. Nho thi vong lap quay lai doc socket
-// thuong xuyen hon (it hut hon). 1024 byte = 32 ms.
-#define IO_CHUNK        1024
+// Hang rong bao lau thi tra loa, bat lai mic. Cau ke tiep cua server (result-*,
+// cau noi cua chi duong) thuong toi sat sau; tat-bat mic lien tuc la vo ich.
+#define IDLE_EXIT_MS    400
+
+// Reply co audio: cho khoi 0x02 / reply_end toi da bay lau sau lan cuoi co viec.
+// Qua han thi coi nhu server bo do, tra loa — khong om mic vinh vien.
+#define REPLY_AUDIO_WAIT_MS 8000
+
+// So byte/giay cua ADPCM 16 kHz khoi 256: 256 * 16000 / 505.
+static const uint32_t ADPCM_BPS = (uint32_t)ADPCM_BLOCK_BYTES * SR / ADPCM_BLOCK_SAMPLES;
 
 // ---------------------------------------------------------------- nan tieng
-// Trang thai nan tieng, giu giua cac mieng. Ban nap-tron nhin thay ca cau;
-// ban nay khong, nen moi thu phai co trang thai.
 static struct {
-  float   hpX, hpY, hpA;      // hpA tinh tu tan so lay mau, xem scondReset()
-  size_t  done;
-  size_t  fade;
+  float   hpX, hpY, hpA;
   int32_t peak;
-  size_t  clipped;
 } scond;
 
-static void scondReset(uint32_t rate) {
+static void scondReset() {
   scond.hpX = scond.hpY = 0.0f;
-
-  // 🔴 He so PHAI tinh tu tan so that, khong duoc de hang so. Server tra 16 kHz
-  // nhung tung tra 48 kHz, va cung mot he so o hai tan so la hai tan so cat
-  // khac nhau gap ba lan — o 48 kHz thi 180 Hz se thanh 540 Hz va nuot mat
-  // phan than cua giong noi.
-  scond.hpA = rate ? expf(-2.0f * (float)M_PI * PLAY_HPF_HZ / (float)rate)
-                   : 0.93f;
-  scond.done = 0;
-  scond.fade = (size_t)rate * FADE_MS / 1000;
-  if (scond.fade == 0) scond.fade = 1;
+  scond.hpA = expf(-2.0f * (float)M_PI * PLAY_HPF_HZ / (float)SR);
   scond.peak = 0;
-  scond.clipped = 0;
 }
 
-// `left` = so mau CHAC CHAN con lai sau mieng nay, hoac (size_t)-1 khi chua
-// biet cau con dai bao nhieu. Chi vuot xuong khi da biet diem ket thuc — day
-// la ly do vong lap ben duoi giu lai mot doan cuoi chua xu ly.
-static void scondChunk(int16_t *p, size_t n, size_t left) {
-  const float A = scond.hpA;     // thong cao PLAY_HPF_HZ, xem scondReset()
+// Loc + ha muc + vuot hai dau TAI CHO, roi day ra I2S.
+static bool writeOut(int16_t *p, size_t n, bool fadeIn, bool fadeOut) {
+  const float  A    = scond.hpA;
+  const size_t fade = (size_t)SR * FADE_MS / 1000;
 
   for (size_t i = 0; i < n; i++) {
     float x = (float)p[i];
@@ -138,309 +88,323 @@ static void scondChunk(int16_t *p, size_t n, size_t left) {
 
     int32_t a = (int32_t)(x < 0 ? -x : x);
     if (a > scond.peak) scond.peak = a;
-    if (a >= 32000) scond.clipped++;
 
     int32_t v = (int32_t)(y * PLAY_GAIN_PCT / 100.0f);
+    if (fadeIn && i < fade)            v = (int32_t)((int64_t)v * i / fade);
+    if (fadeOut && n - 1 - i < fade)   v = (int32_t)((int64_t)v * (n - 1 - i) / fade);
+    p[i] = v > 32767 ? 32767 : (v < -32768 ? -32768 : (int16_t)v);
+  }
 
-    size_t pos = scond.done + i;
-    if (pos < scond.fade) v = (int32_t)((int64_t)v * pos / scond.fade);
-
-    if (left != (size_t)-1) {
-      size_t toEnd = left + (n - 1 - i);
-      if (toEnd < scond.fade) v = (int32_t)((int64_t)v * toEnd / scond.fade);
+  size_t bytes = n * sizeof(int16_t), put = 0, w;
+  while (put < bytes) {
+    if (i2s_channel_write(i2sTx, (uint8_t *)p + put, bytes - put, &w,
+                          1000 / portTICK_PERIOD_MS) != ESP_OK) {
+      Serial.println("LOI write ra loa");
+      return false;
     }
-
-    p[i] = v > 32767 ? 32767 : (v < -32768 ? -32768 : (int16_t)v);
+    put += w;
   }
-  scond.done += n;
+  return true;
 }
 
-// Vuot bien do tuyen tinh tu `from` sang `to` trong mot mieng. Dung de dong
-// va mo tieng quanh cho hut, thay cho viec cat phang.
-static void applyRamp(int16_t *p, size_t n, float from, float to) {
-  if (n == 0) return;
-  for (size_t i = 0; i < n; i++) {
-    float g = from + (to - from) * ((float)i / (float)n);
-    int32_t v = (int32_t)(p[i] * g);
-    p[i] = v > 32767 ? 32767 : (v < -32768 ? -32768 : (int16_t)v);
+// ---------------------------------------------------------- giu mot khoi lai
+// 🔴 Luon GIU LAI khoi vua giai, chi ghi khoi TRUOC no. Ly do: chi biet mot
+// khoi la khoi CUOI cua doan khi khoi sau khong toi — luc do no phai duoc vuot
+// xuong, ma da ghi ra DMA roi thi khong vuot duoc nua. Cau cua chi duong live
+// khong co `reply_end`, nen "het cau" chi biet bang cach doi.
+static int16_t s_pend[ADPCM_BLOCK_SAMPLES];
+static size_t  s_pendN   = 0;
+static bool    s_segOpen = false;   // da ghi it nhat mot khoi cua doan nay
+
+static void emit(const int16_t *pcm, size_t n) {
+  if (s_pendN) {
+    writeOut(s_pend, s_pendN, !s_segOpen, false);
+    s_segOpen = true;
   }
+  memcpy(s_pend, pcm, n * sizeof(int16_t));
+  s_pendN = n;
 }
 
-// ============================================================================
-// Vua nhan vua phat
-// ============================================================================
-// Bo dem vong mot nguoi ghi mot nguoi doc, ca hai deu la task nay nen khong
-// can khoa. stStart luon la boi so cua frameBytes vi chi bao gio pop tron
-// frame — nho vay ep kieu sang int16_t* luon can bang.
-bool playPcmStream(PcmSource &src, const AudioFmt &fmt, size_t totalBytes) {
-  if (!stageBuf) { Serial.println("Chua co bo dem phat"); return false; }
+static void endSegment() {
+  if (s_pendN) writeOut(s_pend, s_pendN, !s_segOpen, true);
+  s_pendN   = 0;
+  s_segOpen = false;
+}
 
-  const uint32_t rate = fmt.rate;
-  const size_t   frameBytes = (size_t)fmt.ch * 2;
+// ---------------------------------------------------------------- trang thai
+static PlayerPlayedFn s_onPlayed = nullptr;
+void playerSetPlayedHandler(PlayerPlayedFn fn) { s_onPlayed = fn; }
 
-  Serial.printf("Phat theo luong: %u Hz, %u kenh, 16-bit\n",
-                (unsigned)rate, fmt.ch);
+static bool          s_active   = false;
+static wifi_power_t  s_txSaved;
 
-  if (rate != i2sCurRate) {
-    Serial.printf("Doi I2S sang %u Hz\n", (unsigned)rate);
-    if (!i2sSetSampleRate(rate)) return false;
-  }
-  scondReset(rate);
+// Luot dang phat. Mot `reply` mo luot, `reply_end` dong luot.
+static char          s_turn[48]    = "";
+static bool          s_cueOnly     = false;   // reply.audio == null: bao played sau cue
+static unsigned long s_replyAt     = 0;       // luc moc REPLY duoc xu ly
+static unsigned long s_firstAudio  = 0;
 
-  const size_t bytesPerMs = (size_t)rate * frameBytes / 1000;
+// Preroll cho doan tieng sap mo.
+static bool          s_preArmed    = true;
+static uint32_t      s_preBytes    = 0;
+static unsigned long s_preSince    = 0;
 
-  size_t gate      = bytesPerMs * PREBUF_MS;        // muc can co de (tai) mo loa
-  size_t refillMs  = REFILL_START_MS;               // lon dan sau moi lan hut
-  const size_t danger = bytesPerMs * DANGER_MS;
-  if (gate > stageCap / 2) gate = stageCap / 2;
+bool playerActive() { return s_active; }
 
-  size_t stStart = 0, stUsed = 0;
-  float  duck = 1.0f;              // 1 = dang phat binh thuong, 0 = da dong tieng
+static void armPreroll(uint32_t ms) {
+  uint32_t b = ADPCM_BPS * ms / 1000;
+  b = (b + ADPCM_BLOCK_BYTES - 1) / ADPCM_BLOCK_BYTES * ADPCM_BLOCK_BYTES;
+  s_preArmed = true;
+  s_preBytes = b;
+  s_preSince = millis();
+}
 
-  // Toc do phat can duoc dam bao. Neu server day cham hon con so nay thi
-  // KHONG co cach nao phat lien mach trong luc van dang nhan — bo dem se can,
-  // dem to bao nhieu cung chi doi cho dut sang muon hon. Luc do lua chon duy
-  // nhat con lai la doi nhan xong roi moi phat.
-  const size_t bytesPerSec = (size_t)rate * frameBytes;
-  bool decided = false, waitAll = false;
+static void markAudio() {
+  if (s_turn[0] && !s_firstAudio) s_firstAudio = millis();
+}
 
-  // Moc de do toc do on dinh: chot lai luong da nhan sau WARMUP_MS, roi tinh
-  // toc do tu do tro di. Bo qua cum xa dau tien cua bo giai ma.
-  unsigned long warmT = 0, tDecide = 0;
-  size_t        warmIn = 0;
-  int           lastMode = -1, lastLogged = -1;
+static void reportPlayed(unsigned long firstByteMs) {
+  if (!s_turn[0]) return;
+  if (s_firstAudio && s_onPlayed) s_onPlayed(s_turn, firstByteMs, s_firstAudio);
+  s_turn[0] = 0;
+  s_cueOnly = false;
+}
 
+static void openOut() {
+  if (s_active) return;
+  s_active = true;
+  // Tat mic trong luc phat, giong duong cu: khong ai doc RX thi DMA RX tran.
   i2s_channel_disable(i2sRx);
+  i2sSetSampleRate(SR);
 #if LOWER_WIFI_TX
-  wifi_power_t txSaved = WiFi.getTxPower();
+  s_txSaved = WiFi.getTxPower();
   WiFi.setTxPower(WIFI_POWER_11dBm);
 #endif
+  scondReset();
+  s_pendN = 0;
+  s_segOpen = false;
+}
 
-  bool          playing = false, netEof = false, ioErr = false;
-  unsigned long tStart = millis(), tStall = millis(), tBeat = millis(), tFirst = 0;
-  size_t        written = 0, totalIn = 0, underruns = 0;
-
-  for (;;) {
-    // ---- hut tu mang
-    if (!netEof && stUsed < stageCap) {
-      size_t wpos = (stStart + stUsed) % stageCap;
-      size_t room = stageCap - stUsed;
-      if (room > stageCap - wpos) room = stageCap - wpos;   // toi mep vong
-
-      int got = pcmRead(src, stageBuf + wpos, room);
-      if (got > 0) {
-        stUsed  += got;
-        totalIn += got;
-        tStall = millis();
-      } else if (got < 0) {
-        netEof = true;
-      } else {
-        int budget = tFirst ? BODY_GAP_MS : FIRST_AUDIO_MS;
-        if (millis() - tStall > (unsigned long)budget) {
-          Serial.printf("Im %d s %s — dung nhan\n", budget / 1000,
-                        tFirst ? "giua cau" : "tu luc gui xong");
-          netEof = true;
-        } else if (millis() - tBeat >= 10000) {
-          tBeat = millis();
-          Serial.printf("  ... cho tieng: da nhan %u byte sau %lu s\n",
-                        (unsigned)totalIn, (millis() - tStart) / 1000);
-        }
-      }
-    }
-
-    // ---- chot moc do sau khi cum xa dau tien di qua
-    if (!warmT && millis() - tStart >= WARMUP_MS) {
-      warmT  = millis();
-      warmIn = totalIn;
-    }
-
-    // ---- danh gia lai nguong, LIEN TUC cho toi khi bat dau phat
-    //
-    // 🔴 Truoc day chot mot lan roi thoi. Sai: nguon day theo CUM roi nghi,
-    // nen mot cua so 900 ms trung vao khoang nghi cho ra 0 KB/s, va tu do
-    // ket luan sai ve ca doan. Do lien tuc tren toan bo thoi gian da troi
-    // qua thi cac cum va cac khoang nghi tu can bang nhau.
-    bool measured = warmT && (millis() - warmT) >= MEASURE_MS;
-    if (!playing && measured && (millis() - tDecide >= 1000 || netEof)) {
-      tDecide = millis();
-      unsigned long el = millis() - warmT;
-      double r = el ? (double)(totalIn - warmIn) * 1000.0 / (double)el : 0.0;
-      double margin = (double)bytesPerSec > 0 ? r / (double)bytesPerSec : 0.0;
-
-      int mode;                       // 0=400ms 1=1500ms 2=tinh chinh xac 3=doi het
-      if (margin >= 1.30)             mode = 0;
-      else if (margin >= 1.12)        mode = 1;
-      else if (totalBytes > 0)        mode = 2;
-      else                            mode = 3;
-
-      if (mode != lastMode) {
-        lastMode = mode;
-        Serial.printf("Nguon %.1f KB/s / can %.1f KB/s = du %.0f%%\n",
-                      r / 1024.0, bytesPerSec / 1024.0, margin * 100.0);
-      }
-      decided = true;
-
-      if (mode == 0) {
-        gate = bytesPerMs * 400;
-        if (mode != lastLogged) { Serial.println("=> Du rong rai: dem 400 ms."); lastLogged = mode; }
-      } else if (mode == 1) {
-        gate = bytesPerMs * 1500;
-        if (mode != lastLogged) { Serial.println("=> Du vua phai: dem 1500 ms."); lastLogged = mode; }
-      } else if (mode == 2) {
-        // Biet tong do dai thi tinh duoc CHINH XAC luc nao phat an toan,
-        // khong phai doi het.
-        //
-        // Bo dem voi B byte, nhan them r B/s, phat het P B/s => muc dem tut
-        // (P - r) B/s, can duoc B/(P-r) giay. Phat het ca cau mat T/P giay.
-        // Khong dut khi  T/P <= B/(P-r)  <=>  B >= T * (1 - r/P).
-        double frac = 1.0 - r / (double)bytesPerSec;
-        size_t need = (size_t)((double)totalBytes * frac);
-        size_t cap  = stageCap - (size_t)IO_CHUNK * 2;
-        if (need > cap) need = cap;
-        gate = need;
-        if (mode != lastLogged) {
-          lastLogged = mode;
-          Serial.printf("=> Doi den %u/%u byte (%.0f%%) roi phat.\n",
-                        (unsigned)need, (unsigned)totalBytes, frac * 100.0);
-        }
-      } else {
-        // Nguon CHAM HON toc do phat va khong biet tong do dai.
-        //
-        // 🔴 Truoc day cho vao day mot con so dem lon (3000 ms) — SAI han ve
-        // nguyen ly. Nguon chay cham hon coi tieu thu thi bo dem tut deu dan,
-        // dem to bao nhieu cung chi doi cho dut sang muon hon chu khong bo
-        // duoc. Cach duy nhat la doi nhan XONG. Doi lai do tre, nhung mot
-        // khoang cho duy nhat de chiu hon tieng noi dut quang lien tuc.
-        waitAll = true;
-        if (mode != lastLogged) {
-          lastLogged = mode;
-          Serial.println("=> Nguon cham hon toc do phat: doi nhan xong roi phat.");
-        }
-      }
-    }
-
-    // ---- mo loa
-    // Bo dem gan day thi phai phat du dang o che do doi: khong con cho chua.
-    bool bufFull = stUsed >= stageCap - (size_t)IO_CHUNK * 2;
-    if (!playing && (netEof || bufFull || (decided && !waitAll && stUsed >= gate))) {
-      playing = true;
-      if (!tFirst) {
-        tFirst = millis();
-        Serial.printf(">>> DANG PHAT (cho dem %lu ms, %u byte)...\n",
-                      tFirst - tStart, (unsigned)stUsed);
-      }
-    }
-
-    // ---- day mot mieng ra loa
-    if (playing) {
-      // Chua biet cau ket thuc o dau thi giu lai dung mot doan fade, de luc
-      // phat hien het luong con co cai ma vuot xuong, khong cat phut.
-      size_t avail = stUsed;
-      if (!netEof) {
-        size_t hold = scond.fade * frameBytes;
-        avail = avail > hold ? avail - hold : 0;
-      }
-
-      size_t run = avail;
-      if (run > stageCap - stStart) run = stageCap - stStart;
-      if (run > IO_CHUNK) run = IO_CHUNK;
-      run -= run % frameBytes;
-
-      if (run > 0) {
-        int16_t *p = (int16_t *)(stageBuf + stStart);
-        size_t   outBytes = run;
-
-        if (fmt.ch == 2) {          // I2S dang mono: tron hai kenh tai cho
-          size_t frames = run / 4;
-          for (size_t i = 0; i < frames; i++)
-            p[i] = (int16_t)(((int32_t)p[2 * i] + p[2 * i + 1]) / 2);
-          outBytes = frames * 2;
-        }
-
-        size_t leftAfter = netEof ? (stUsed - run) / frameBytes : (size_t)-1;
-        scondChunk(p, outBytes / 2, leftAfter);
-
-        // Vuot quanh cho hut. Day moi la thu quyet dinh tai co nghe ra khoang
-        // dut hay khong — cat phang giua song am tao ra mot buoc nhay, va
-        // buoc nhay do nghe thanh tieng "bup". Vuot xuong roi vuot len thi
-        // cung khoang lang ay lai nghe nhu mot quang nghi binh thuong.
-        bool willStarve = !netEof && (stUsed - run) < danger;
-
-        if (willStarve && duck > 0.5f) {
-          applyRamp(p, outBytes / 2, 1.0f, 0.0f);
-          duck = 0.0f;
-        } else if (!willStarve && duck < 0.5f) {
-          applyRamp(p, outBytes / 2, 0.0f, 1.0f);
-          duck = 1.0f;
-        } else if (duck < 0.5f) {
-          applyRamp(p, outBytes / 2, 0.0f, 0.0f);   // van dang dong
-        }
-
-        size_t put = 0, n;
-        while (put < outBytes) {
-          if (i2s_channel_write(i2sTx, (uint8_t *)p + put, outBytes - put, &n,
-                                1000 / portTICK_PERIOD_MS) != ESP_OK) {
-            Serial.println("LOI write ra loa");
-            ioErr = true;
-            break;
-          }
-          put += n;
-        }
-        if (ioErr) break;
-
-        written += outBytes;
-        stStart  = (stStart + run) % stageCap;
-        stUsed  -= run;
-      } else if (!netEof) {
-        // Bo dem can day. Dong lai cho nap them thay vi phat nho giot — hut
-        // lien tuc nghe con te hon mot khoang lang duy nhat.
-        //
-        // Va NOI RONG muc nap lai: mang da chung to la khong theo kip, nen
-        // mo lai o dung muc cu thi chac chan hut tiep. Tu lon dan nghia la
-        // mang tot khong phai tra gia gi, mang xau thi chi giat mot lan roi
-        // no tu chuyen sang che do an toan.
-        playing = false;
-        underruns++;
-
-        // Hut lan thu hai la du bang chung: nguon khong theo kip, khong phai
-        // chi giat mot nhip. Nang dem tiep chi keo dai chuoi giat — chuyen han
-        // sang doi nhan xong. Mot khoang lang duy nhat de chiu hon nhieu so
-        // voi tieng noi dut quang lien tuc.
-        if (underruns >= 2 && !waitAll) {
-          waitAll = true;
-          Serial.println("  hut lan thu hai -> chuyen sang doi nhan xong roi phat tiep");
-        } else if (!waitAll && refillMs < REFILL_MAX_MS) {
-          gate = bytesPerMs * refillMs;
-          if (gate > stageCap / 2) gate = stageCap / 2;
-          Serial.printf("  hut lan %u -> nang dem len %u ms\n",
-                        (unsigned)underruns, (unsigned)refillMs);
-          refillMs += REFILL_STEP_MS;
-        }
-      }
-    }
-
-    if (netEof && stUsed < frameBytes) break;
-    if (!playing) vTaskDelay(2 / portTICK_PERIOD_MS);
-  }
-
+static void closeOut() {
+  if (!s_active) return;
+  endSegment();
   i2sWriteSilence(FLUSH_MS);
-
-  Serial.printf("Phat %u byte (~%lu ms tieng), so lan hut: %u\n",
-                (unsigned)written, (unsigned long)(written / 2 * 1000UL / rate),
-                (unsigned)underruns);
-  Serial.printf("PCM: dinh=%d, mau cham tran=%u\n",
-                (int)scond.peak, (unsigned)scond.clipped);
-  if (underruns > 0)
-    Serial.println("=> Loa bi hut. Nang PREBUF_MS len, hoac server day cham qua.");
-
 #if LOWER_WIFI_TX
-  WiFi.setTxPower(txSaved);
+  WiFi.setTxPower(s_txSaved);
 #endif
   if (i2s_channel_enable(i2sRx) != ESP_OK)
     Serial.println("Khong bat lai duoc mic sau khi phat");
-  i2sSetSampleRate(SR);
+  s_active = false;
+  armPreroll(PREROLL_DEFAULT_MS);
+}
 
-  return !ioErr && written > 0;
+// Phat tron mot clip tu flash. Tra ve false neu bi stop() cat ngang.
+static bool playClip(const char *id, PlayerStopFn stop) {
+  const CueClip *c = cueFind(id);
+  if (!c) return true;
+  endSegment();
+
+  int16_t  pcm[ADPCM_BLOCK_SAMPLES];
+  uint32_t left = c->samples;
+  for (uint32_t off = 0; off < c->bytes && left; off += ADPCM_BLOCK_BYTES) {
+    if (stop && stop()) { s_pendN = 0; s_segOpen = false; return false; }
+    size_t blk = c->bytes - off < ADPCM_BLOCK_BYTES ? c->bytes - off : ADPCM_BLOCK_BYTES;
+    size_t n   = adpcmDecodeBlock(c->data + off, blk, pcm, ADPCM_BLOCK_SAMPLES);
+    if (n > left) n = left;           // cat phan dem cua khoi cuoi
+    left -= n;
+    markAudio();
+    emit(pcm, n);
+  }
+  endSegment();
+  return true;
+}
+
+// ============================================================================
+bool playerPump(PlayerStopFn stop) {
+  if (!pqReady()) return false;
+  if (!s_active && pqEmpty()) return false;
+
+  openOut();
+
+  unsigned long tLast = millis();      // lan cuoi co viec gi de lam
+  uint8_t       blk[ADPCM_BLOCK_BYTES];
+  int16_t       pcm[ADPCM_BLOCK_SAMPLES];
+  char          urg[24];
+
+  for (;;) {
+    if (stop && stop()) {
+      // Bo khoi dang giu, khong vuot: nguoi dung vua bam la muon IM ngay.
+      s_pendN = 0;
+      s_segOpen = false;
+      s_turn[0] = 0;
+      closeOut();
+      return true;
+    }
+
+    // ---- 1. clip khan: cat ngang moi thu
+    if (pqTakeUrgent(urg, sizeof(urg))) {
+      if (!playClip(urg, stop)) continue;     // vong sau se bat stop()
+      armPreroll(PREROLL_DEFAULT_MS);
+      tLast = millis();
+      continue;
+    }
+
+    // ---- 2. moc da toi
+    PqEvent e;
+    bool due = pqDueEvent(e);
+
+    // Reply khong co audio: bao played ngay khi cue cua no da phat xong, tuc
+    // khi moc ke tiep KHONG con la cue nua. Khong doi reply_end — server co
+    // the khong gui reply_end cho reply chi co cue.
+    if (s_cueOnly && !(due && e.type == PQ_CUE)) reportPlayed(s_replyAt);
+
+    if (due) {
+      pqPopEvent();
+      tLast = millis();
+      if (e.type == PQ_REPLY) {
+        endSegment();
+        if (s_turn[0]) reportPlayed(0);       // reply truoc bi cat, khong co reply_end
+        strncpy(s_turn, e.turn, sizeof(s_turn) - 1);
+        s_turn[sizeof(s_turn) - 1] = 0;
+        s_firstAudio = 0;
+        // Moc REPLY mang luc khung `reply` TOI kinh — voi reply chi co cue,
+        // do la "byte audio dau" gan dung nhat ma kinh co.
+        s_replyAt    = e.firstByteMs ? e.firstByteMs : millis();
+        s_cueOnly    = !e.hasAudio;
+        armPreroll(e.prerollMs ? e.prerollMs : PREROLL_DEFAULT_MS);
+      } else if (e.type == PQ_CUE) {
+        playClip(e.cue, stop);
+      } else if (e.type == PQ_REPLY_END) {
+        endSegment();
+        if (strcmp(e.turn, s_turn) == 0) reportPlayed(e.firstByteMs);
+        armPreroll(PREROLL_DEFAULT_MS);
+      }
+      continue;
+    }
+
+    // ---- 3. tieng
+    size_t avail = pqAvail();
+    // Co moc xep sau thi phan tieng truoc no da ve DU — khong phai doi
+    // preroll, va khoi cut cuoi (neu co) cung la khoi that, giai luon.
+    bool bounded = pqHasEvent();
+
+    if (avail > 0 && (avail >= ADPCM_BLOCK_BYTES || bounded)) {
+      if (s_preArmed && !s_segOpen && !s_pendN) {
+        if (avail < s_preBytes && !bounded &&
+            millis() - s_preSince < PREROLL_MAX_WAIT_MS) {
+          vTaskDelay(2 / portTICK_PERIOD_MS);
+          continue;
+        }
+        s_preArmed = false;
+      }
+      size_t got = pqRead(blk, ADPCM_BLOCK_BYTES);
+      size_t n   = adpcmDecodeBlock(blk, got, pcm, ADPCM_BLOCK_SAMPLES);
+      if (n) {
+        markAudio();
+        emit(pcm, n);
+      }
+      tLast = millis();
+      continue;
+    }
+
+    // ---- khong co gi doc duoc luc nay
+    if (s_pendN && millis() - tLast > STARVE_MS) {
+      endSegment();                         // het doan: vuot xuong khoi cuoi
+      armPreroll(PREROLL_DEFAULT_MS);       // doan sau lai dem tu dau
+    }
+    // 🔴 Reply CO audio ma chua toi reply_end thi KHONG tra loa. Do that tren
+    // board (2026-10-20): khoi 0x02 dau toi ~0.4-0.5 s SAU khung `reply`, va
+    // server sinh tieng theo TUNG CAU nen giua hai cau con im lau hon nua. Tra
+    // loa o IDLE_EXIT_MS la tat-bat mic va mo loa lai nhieu lan cho MOT cau tra
+    // loi — log in "Phat xong (dinh PCM 0)" ngay sau moi reply.
+    bool replyOpen = s_turn[0] && !s_cueOnly &&
+                     millis() - tLast < REPLY_AUDIO_WAIT_MS;
+    if (!s_pendN && pqEmpty() && !replyOpen && millis() - tLast > IDLE_EXIT_MS) {
+      if (s_cueOnly) reportPlayed(s_replyAt);
+      closeOut();
+      Serial.printf("Phat xong (dinh PCM %d)\n", (int)scond.peak);
+      return false;
+    }
+    vTaskDelay(2 / portTICK_PERIOD_MS);
+  }
+}
+
+// ============================================================================
+// Cuoc goi: loa va mic chay CUNG luc
+// ============================================================================
+// Dem chong giat: du bay nhieu khoi moi bat dau phat, va lai dem tu dau moi
+// lan dut. Server da dem 60 ms (CALL_JITTER_MS) o phia app; phan nay lo chang
+// server -> Cloudflare -> Wi-Fi.
+#define CALL_PREROLL_BLOCKS  3      // ~95 ms
+// 🔴 Tieng don lai qua tran thi BO bot, khong phat het. Dong ho cua app va
+// cua kinh lech nhau mot chut, cong voi moi lan mang nghen xa ra mot cuc —
+// phat het thi do tre cuoc goi chi tang, sau vai phut hai ben noi de len nhau.
+#define CALL_MAX_BLOCKS      16     // ~505 ms
+#define CALL_KEEP_BLOCKS     4
+
+static bool s_callPre    = true;    // dang dem lai preroll
+static bool s_callSilent = true;    // khoi vua ghi la im lang -> khoi sau vuot len
+
+void playerCallBegin() {
+  if (s_active) closeOut();
+  i2sSetSampleRate(SR);
+#if LOWER_WIFI_TX
+  s_txSaved = WiFi.getTxPower();
+  WiFi.setTxPower(WIFI_POWER_11dBm);
+#endif
+  scondReset();
+  s_callPre    = true;
+  s_callSilent = true;
+  // 🔴 Moi DAY DMA truoc (CLAUDE.md muc 5: DMA TX lo lung o muc can la re).
+  // Sau do moi vong ghi dung mot khoi bang dung mot khoi mic doc ra, nen DMA
+  // dung yen o muc day — doi lai loa tre ~240 ms co dinh.
+  i2sWriteSilence(300);
+}
+
+void playerCallStep() {
+  const size_t BB = ADPCM_BLOCK_BYTES;
+  uint8_t blk[ADPCM_BLOCK_BYTES];
+  int16_t pcm[ADPCM_BLOCK_SAMPLES];
+
+  // Moc (reply sau cuoc goi) KHONG lay o day: pqAvail() dung truoc moc, nen
+  // tieng cuoc goi phat toi moc roi thoi, phan sau moc de playerPump() lo.
+  size_t avail = pqAvail();
+  if (s_callPre && avail >= CALL_PREROLL_BLOCKS * BB) s_callPre = false;
+
+  if (!s_callPre && avail > CALL_MAX_BLOCKS * BB) {
+    size_t drop = 0;
+    while (pqAvail() > CALL_KEEP_BLOCKS * BB) drop += pqRead(blk, BB);
+    Serial.printf("Goi: tieng den don %u B — bo bot de khong tre them\n", (unsigned)drop);
+  }
+
+  if (!s_callPre && pqAvail() >= BB) {
+    size_t got = pqRead(blk, BB);
+    size_t n   = adpcmDecodeBlock(blk, got, pcm, ADPCM_BLOCK_SAMPLES);
+    if (n) {
+      writeOut(pcm, n, s_callSilent, false);
+      s_callSilent = false;
+      return;
+    }
+  }
+
+  // Het tieng: phat MOT khoi im lang dung bang mot khoi mic, de nhip vong
+  // khong doi, roi dem lai preroll.
+  if (!s_callPre && !s_callSilent) s_callPre = true;
+  memset(pcm, 0, sizeof(pcm));
+  writeOut(pcm, ADPCM_BLOCK_SAMPLES, false, false);
+  s_callSilent = true;
+}
+
+void playerCallEnd() {
+  // Bo tieng cuoc goi con sot. pqRead() dung truoc moc ke tiep, nen `reply
+  // result-*` toi sau cuoc goi ("Me da cup may...") van con nguyen.
+  uint8_t blk[ADPCM_BLOCK_BYTES];
+  while (pqRead(blk, sizeof(blk))) {}
+  i2sWriteSilence(FLUSH_MS);
+#if LOWER_WIFI_TX
+  WiFi.setTxPower(s_txSaved);
+#endif
+  armPreroll(PREROLL_DEFAULT_MS);
 }
 
 // Sinh song sin sach roi day thang ra loa. Khong qua duong nan tieng: muon tin

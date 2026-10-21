@@ -38,6 +38,23 @@
 static framesize_t camFrameSize  = FRAMESIZE_HD;    // 1280 x 720
 static int         camJpegQuality = 18;
 
+// Co frame buffer cap phat luc init. Lon hon camFrameSize de lenh `capture`
+// cua live OCR lay duoc UXGA ma khong phai init lai camera.
+//
+// 🔴 esp32-camera tinh co frame buffer JPEG tu frame_size LUC INIT
+// (rong x cao / 5). set_framesize() len lon hon sau do thi khung bi cat cut
+// — anh hong nua duoi, khong bao loi. Nen init o co lon nhat se dung roi ha
+// xuong ngay (cameraApplySettings dat camFrameSize) — dung cach vi du
+// CameraWebServer cua Espressif lam. Ton them PSRAM (2 x 384 KB thay vi
+// 2 x 184 KB), PSRAM con du; RAM noi khong doi vi DMA cua camera co tran rieng.
+static framesize_t camAllocSize = FRAMESIZE_UXGA;
+
+// Che do dang nap vao cam bien, de cameraSetMode() bo qua khi khong doi.
+static framesize_t camCurSize    = FRAMESIZE_HD;
+static int         camCurQuality = 18;
+
+static SemaphoreHandle_t camMutex = nullptr;
+
 // esp_camera_init() thanh cong hay chua.
 static bool cameraReady = false;
 
@@ -54,6 +71,9 @@ const char *cameraFrameSizeName(framesize_t size) {
     case FRAMESIZE_XGA:  return "XGA 1024 x 768";
     case FRAMESIZE_SVGA: return "SVGA 800 x 600";
     case FRAMESIZE_VGA:  return "VGA 640 x 480";
+    case FRAMESIZE_HVGA: return "HVGA 480 x 320";
+    case FRAMESIZE_CIF:  return "CIF 400 x 296";
+    case FRAMESIZE_QVGA: return "QVGA 320 x 240";
     default:             return "khac";
   }
 }
@@ -108,6 +128,7 @@ static void buildCameraConfig(camera_config_t &config) {
   if (!psramFound()) {
     camFrameSize  = FRAMESIZE_SVGA;
     camJpegQuality = 12;
+    camAllocSize  = FRAMESIZE_SVGA;
 
     config.fb_location = CAMERA_FB_IN_DRAM;
     config.fb_count = 1;
@@ -123,7 +144,9 @@ static void buildCameraConfig(camera_config_t &config) {
     config.grab_mode = CAMERA_GRAB_LATEST;
   }
 
-  config.frame_size = camFrameSize;
+  // Cap phat theo co LON nhat se dung; cameraApplySettings() ha ve
+  // camFrameSize ngay sau init. Xem ghi chu o camAllocSize.
+  config.frame_size = camAllocSize;
 
   // Gia tri nho hon = JPEG tot hon. Giu khop voi set_quality().
   config.jpeg_quality = camJpegQuality;
@@ -198,6 +221,9 @@ bool cameraStart() {
 
   Serial.println("Camera init thanh cong");
   cameraReady = true;
+  if (!camMutex) camMutex = xSemaphoreCreateRecursiveMutex();
+  camCurSize    = camFrameSize;
+  camCurQuality = camJpegQuality;
 
   // ---------------------------------------------------
   // Lay cam bien va ap dung profile
@@ -231,5 +257,107 @@ bool cameraReinit() {
   }
 
   cameraApplySettings(esp_camera_sensor_get());
+  camCurSize    = camFrameSize;
+  camCurQuality = camJpegQuality;
   return true;
+}
+
+// =====================================================
+// Doi che do luc dang chay
+// =====================================================
+void cameraLock() {
+  if (camMutex) xSemaphoreTakeRecursive(camMutex, portMAX_DELAY);
+}
+
+void cameraUnlock() {
+  if (camMutex) xSemaphoreGiveRecursive(camMutex);
+}
+
+bool jpegSize(const uint8_t *p, size_t len, uint16_t *w, uint16_t *h) {
+  if (!p || len < 4 || p[0] != 0xFF || p[1] != 0xD8) return false;
+  size_t i = 2;
+  // Di qua tung segment toi SOF0..SOF3 (0xC0-0xC3). OV2640 dat SOF ngay sau
+  // vai segment dau, nen chi phai nhay vai lan — khong quet tron khung.
+  while (i + 9 < len) {
+    if (p[i] != 0xFF) return false;
+    uint8_t m = p[i + 1];
+    if (m == 0xFF) { i++; continue; }
+    uint16_t seg = ((uint16_t)p[i + 2] << 8) | p[i + 3];
+    if (m >= 0xC0 && m <= 0xC3) {
+      *h = ((uint16_t)p[i + 5] << 8) | p[i + 6];
+      *w = ((uint16_t)p[i + 7] << 8) | p[i + 8];
+      return true;
+    }
+    if (m == 0xDA) return false;      // toi du lieu anh ma chua thay SOF
+    i += 2 + seg;
+  }
+  return false;
+}
+
+static uint32_t pixels(framesize_t fs) {
+  return (uint32_t)resolution[fs].width * resolution[fs].height;
+}
+
+framesize_t cameraSetMode(framesize_t fs, int quality) {
+  if (pixels(fs) > pixels(camAllocSize)) {
+    Serial.printf("Camera: %s lon hon co da cap phat — kep ve %s\n",
+                  cameraFrameSizeName(fs), cameraFrameSizeName(camAllocSize));
+    fs = camAllocSize;
+  }
+  if (quality < 4)  quality = 4;
+  if (quality > 63) quality = 63;
+  if (fs == camCurSize && quality == camCurQuality) return fs;
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) return camCurSize;
+  bool sizeChanged = (fs != camCurSize);
+  if (sizeChanged)                s->set_framesize(s, fs);
+  if (quality != camCurQuality)   s->set_quality(s, quality);
+  camCurSize    = fs;
+  camCurQuality = quality;
+
+  // 🔴 Doi do phan giai xong thi BO khung cho toi khi JPEG THAT SU mang kich
+  // thuoc moi. Do that tren board (2026-10-20):
+  //   - live qvga xen voi anh HD: loat 3 khung chenh nhau 225-3012% (khung cut
+  //     6 KB lan khung phinh 180 KB), burstBest() chon dung cai phinh;
+  //   - bo co dinh 2 khung van chua du: anh luot ngay sau OCR (VGA) van 19 KB
+  //     "1280x720" trong khi anh HD that cua cung canh la 40-50 KB.
+  // fb->width KHONG dung duoc de kiem: driver bao kich thuoc DA CAU HINH, khong
+  // phai kich thuoc cua du lieu trong khung. Kich thuoc that nam trong marker
+  // SOF cua chinh file JPEG — doc no thi het doan.
+  if (sizeChanged) {
+    const uint16_t wantW = resolution[fs].width;
+    unsigned long t = millis();
+    int dropped = 0;
+    for (int k = 0; k < 12; k++) {
+      camera_fb_t *fb = esp_camera_fb_get();
+      if (!fb) continue;
+      uint16_t w = 0, h = 0;
+      bool ok = jpegSize(fb->buf, fb->len, &w, &h) && w == wantW;
+      esp_camera_fb_return(fb);
+      if (ok) break;
+      dropped++;
+    }
+    Serial.printf("Camera: doi sang %s, bo %d khung cu trong %lu ms\n",
+                  cameraFrameSizeName(fs), dropped, millis() - t);
+  }
+  return fs;
+}
+
+void cameraUseDefault() {
+  cameraSetMode(camFrameSize, camJpegQuality);
+}
+
+framesize_t cameraParseSize(const char *name, framesize_t fallback) {
+  if (!name) return fallback;
+  struct { const char *n; framesize_t f; } map[] = {
+    { "qqvga", FRAMESIZE_QQVGA }, { "qvga", FRAMESIZE_QVGA },
+    { "cif",   FRAMESIZE_CIF   }, { "hvga", FRAMESIZE_HVGA },
+    { "vga",   FRAMESIZE_VGA   }, { "svga", FRAMESIZE_SVGA },
+    { "xga",   FRAMESIZE_XGA   }, { "hd",   FRAMESIZE_HD   },
+    { "sxga",  FRAMESIZE_SXGA  }, { "uxga", FRAMESIZE_UXGA },
+  };
+  for (auto &m : map)
+    if (strcasecmp(m.n, name) == 0) return m.f;
+  return fallback;
 }

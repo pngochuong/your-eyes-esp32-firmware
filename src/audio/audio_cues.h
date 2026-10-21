@@ -2,29 +2,40 @@
 #define AUDIO_CUES_H
 
 // ============================================================================
-// Hai tieng bao ngan cho nguoi dung khiem thi
+// Clip cue nam san trong flash + tieng bao loi cuc bo
 // ============================================================================
-// Khoi nay CHI day mau ra I2S. No khong biet mang, khong biet server, khong
-// quyet dinh khi nao keu — audio_service goi no dung luc.
+// Khoi nay CHI tra cuu clip va sinh tieng bip loi. No khong biet mang, khong
+// biet server, khong quyet dinh khi nao keu — audio_service goi no dung luc.
+// Phat clip (qua duong nan tieng chung) la viec cua audio_player.
 //
-// Vi sao phai co: nguoi dung khong nhin man hinh, khong thay den. Sau khi nha
-// nut ho phai doi ~40 giay cho server nghi. Khong co tieng bao thi "dang xu
-// ly" va "mat mang, hong roi" nghe giong het nhau — ho se dung do 40 giay roi
-// moi biet la phai bam lai.
+// Clip la bo cua SERVER (assets/cues/ ben repo server, chep sang cues/ o day),
+// sinh thanh mang C bang tools/gen_cue_clips.py. Kinh khai CUE_VERSION trong
+// `hello`; server thay so nay khop thi chi gui ma cue (`reply.cues`, khung
+// `cue`, `hazard`) thay vi doc thanh tieng qua mang — clip phat ngay, khong
+// cho mot byte nao tu server.
 //
-// 🔴 Ca hai tieng deu phat o dung SR (16000 Hz) — bang tan so cua mic. Nho
-// vay khong phai goi i2sSetSampleRate(): moi lan doi phai tat/bat CA HAI
-// chieu cua cum full-duplex, ton ~90 ms, ma hai tieng nay nam ngay tren duong
-// bam nut nen tiec tung chuc ms.
+// 🔴 Doi bo clip ben server ma quen chay lai gen_cue_clips.py thi kinh van khai
+// version cu. Server thay version THAP hon se doc cue thanh tieng (kinh cu van
+// nghe du), nhung neu version CAO hon/khop ma clip lai thieu thi kinh im lang —
+// nen cueFind() tra NULL phai duoc in ra, khong duoc nuot.
 // ============================================================================
+#include <Arduino.h>
 
-// "Server da nhan lenh" — warm_melodic.wav nhung san trong flash, ~0.94 giay.
-// Goi NGAY SAU khi byte cuoi cua anh + ban thu da ra khoi board, truoc khi
-// ngoi doi server nghi.
-void cueSent();
+struct CueClip {
+  const char    *id;
+  const uint8_t *data;      // khoi "data" IMA ADPCM, khoi 256 byte
+  uint32_t       bytes;
+  uint32_t       samples;   // so mau that (khoi cuoi co dem)
+};
 
-// "Gui hong" — hai tieng 400 Hz ngan. Cao do thap va nhip gat, khac han tieng
-// tren, de nguoi dung phan biet duoc ma khong can nghe ky.
+// Ban clip dang nam trong flash. Khai trong `hello`.
+int cueVersion();
+
+// Tra clip theo ma (vd "received", "hazard_2"). NULL neu khong co.
+const CueClip *cueFind(const char *id);
+
+// "Hong roi, bam lai" — hai tieng 400 Hz ngan. Day thang ra I2S, khong qua
+// mang, khong can clip nao: day la tieng phai keu duoc ca khi mat ket noi.
 void cueError();
 
 #endif  // AUDIO_CUES_H

@@ -15,16 +15,6 @@
 // STA_DISCONNECTED cua driver, phai bat rieng moi thay.
 static volatile int g_lastReason = 0;
 
-// Dia chi da bat tay TLS tron ven duoc. Xem ghi chu o wifi_manager.h.
-static IPAddress g_provenIp;
-static bool      g_haveProven = false;
-
-bool wifiProvenServerIp(IPAddress &out) {
-  if (!g_haveProven) return false;
-  out = g_provenIp;
-  return true;
-}
-
 static void wifiOnDisconnect(WiFiEvent_t /*event*/, WiFiEventInfo_t info) {
   g_lastReason = info.wifi_sta_disconnected.reason;
 }
@@ -387,11 +377,8 @@ bool wifiConnect(unsigned long timeoutMs) {
   // duoc lan that — no chi tieu mat mot lan bat tay dang le dung duoc, va moi
   // lan bat tay bo di con lam phan manh RAM noi (mbedtls xin ~45 KB LIEN).
   //
-  // Gio viec do api_client lam bang apiWarmUp(): cung mot lan bat tay, nhung
-  // GIU phien lai cho lan bam nut dau tien. Mot lan bat tay cho ca phien, thay
-  // vi mot lan bo di cong mot lan that.
-  //
-  // Chuoi day du nam o file .ino: wifiConnect() -> apiResolve() -> apiWarmUp().
+  // Gio lan bat tay DUY NHAT la cua phien WebSocket, va no duoc GIU suot doi
+  // may. Chuoi day du nam o file .ino: wifiConnect() -> startSession().
   dnsSetPublicFirst();
   return true;
 }
@@ -570,13 +557,20 @@ void wifiSelfTest() {
       Serial.printf("DNS %s -> %s (%lu ms)\n",
                     API_HOST, ip.toString().c_str(), millis() - t);
 
+      // 🔴 Phien WS dang giu mot phien TLS ~45 KB. Bat tay them mot phien nua
+      // khi RAM noi lien khong du thi mbedtls co the sap han (da gap trong
+      // bignum.c) — ma day chi la phep thu. Thieu RAM thi bo qua chang nay.
+      size_t big = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
       WiFiClientSecure c2;
       c2.setInsecure();
       // 🔴 Bat tay TLS co dong ho rieng, khong theo tham so cua connect().
       // Thieu dong nay da do duoc 124304 ms cho mot lan "timeout 15 giay".
       c2.setHandshakeTimeout(15);
       t = millis();
-      if (c2.connect(API_HOST, API_PORT, 15000)) {
+      if (big < 50 * 1024) {
+        Serial.printf("Bo qua thu TLS: khoi lien RAM noi chi %u B (phien WS dang giu TLS)\n",
+                      (unsigned)big);
+      } else if (c2.connect(API_HOST, API_PORT, 15000)) {
         Serial.printf("TCP/TLS 443 OK (%lu ms) — duong mang tot\n", millis() - t);
         c2.stop();
       } else {

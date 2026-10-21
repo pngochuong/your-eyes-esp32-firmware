@@ -1,6 +1,8 @@
 # VisionCare — Project Context
 
-Thiết bị hỗ trợ người khiếm thị chạy trên ESP32-S3: **giữ nút → chụp ảnh + thu giọng nói → POST lên server → phát câu trả lời ra loa**. Kèm một web server phụ để xem hình trực tiếp và chỉnh cảm biến.
+Thiết bị hỗ trợ người khiếm thị chạy trên ESP32-S3: **cắm điện là tự nối Wi-Fi + mở phiên WebSocket `wss://api.visioncare-host.uk/v2/session`, giữ suốt → giữ nút → chụp ảnh + thu giọng nói, đẩy dần lên socket → phát câu trả lời, cue, cảnh báo vật cản ra loa; live OCR/chỉ đường theo lệnh server**. Kèm một web server phụ để xem hình trực tiếp và chỉnh cảm biến.
+
+Hợp đồng với server: [FIRMWARE_ENDPOINTS.md](FIRMWARE_ENDPOINTS.md) (nguồn sự thật). Đường `POST /process` cũ **đã gỡ khỏi firmware** (2026-10-20).
 
 Firmware Arduino (sketch `.ino` + thư mục `src/`). Không phải project PlatformIO, không có CMake, không có test tự động — kiểm chứng bằng biên dịch trong Arduino IDE và các lệnh chẩn đoán qua Serial.
 
@@ -13,21 +15,27 @@ setup()                      your-eyes-esp32-firmware.ino
   cameraStart()              không có camera → dừng hẳn, không dựng web server
   webLedBegin()
   wifiConnect(30s)           mất Wi-Fi vẫn đi tiếp (nút/mic/loa phải sống)
+  startSession()             mở WS + hello NGAY — TRƯỚC httpd/audio (TLS cần ~45 KB RAM nội liền)
   startCameraServer()        chỉ khi có IP
-  startAudio()               gọi SAU web server, để camera+httpd chiếm RAM trước
+  startAudio()               bộ đệm, I2S, task "audio" + task "live"
 loop()                       chỉ trông chừng Wi-Fi, cứ 10 s một lần
 
-task "audio" (ghim core 1)   audio_service.cpp — nơi DUY NHẤT biết trình tự
-  consolePoll()              lệnh chẩn đoán Serial
-  giữ BTN  → photoCapture() → recordWhileHeld() → normalizeRecording()
-  nhả BTN  → adpcmEncode() nén 4:1 vào sendBuf (WAV IMA ADPCM dựng sẵn)
-           → apiSendCapture() (multipart: image=JPEG, audio=WAV ADPCM)
-           → playPcmStream() qua PcmSource (ADPCM / PCM thô / WAV / MP3)
+task "wssess" (core 0)       device_session.cpp — MỌI I/O socket
+  hello → hello_ok, ping 25 s, backoff 0.5→8 s, 4000/4401 không tự mở lại
+  gửi theo hàng: turn_start → 0x01 ảnh → 0x03 tiếng (theo luồng) → turn_end; 0x04 live xen giữa
+  nhận: reply/0x02/reply_end/hazard/cue/cam/capture/end → handler của audio_service
 
+task "audio" (core 1)        audio_service.cpp — nơi DUY NHẤT biết trình tự
+  consolePoll()
+  bấm BTN  → pqFlush (ngắt phát) → turn_start → photoCapture() → 0x01
+           → recordWhileHeld() nén ADPCM + đẩy 0x03 từng 1 KB → nhả → turn_end
+  rảnh     → playerPump(): clip khẩn (hazard) > mốc (cue, played) > tiếng 0x02
+
+task "live" (core 0)         camera_live.cpp — chụp theo `cam`/`capture`, gửi 0x04
 core 0                       Wi-Fi/TCP + esp_http_server (stream MJPEG)
 ```
 
-Các khối con (`camera_capture`, `audio_recorder`, `audio_dsp`, `api_client`, `audio_player`) **không biết gì về nhau**. Muốn đổi trình tự → sửa `audio_service.cpp`, đừng sửa các khối.
+Các khối con (`camera_capture`, `camera_live`, `audio_recorder`, `audio_dsp`, `device_session`, `play_queue`, `audio_player`) **không biết gì về nhau**. Muốn đổi trình tự → sửa `audio_service.cpp`, đừng sửa các khối.
 
 ---
 
@@ -66,7 +74,7 @@ Chân **còn trống**: 2, 14, 38, 39, 40, 48 (38–40 là thẻ SD, 48 là NeoP
 Board `ESP32S3 Dev Module` · PSRAM `OPI PSRAM` · Partition Scheme `Huge APP (3MB No OTA/1MB SPIFFS)` · Flash Size `16MB` · arduino-esp32 core 3.3.x.
 Không chọn đúng PSRAM OPI + Huge APP thì firmware (~1.23 MB) **không nạp nổi**.
 
-Thư viện: `esp32-camera`, `driver/i2s_std.h` (ESP-IDF, không dùng `ESP_I2S`), `WiFi`/`WiFiClientSecure`, `esp_http_server`, `libhelix-mp3` (đã chép sẵn vào `src/libhelix-mp3/`).
+Thư viện: `esp32-camera`, `driver/i2s_std.h` (ESP-IDF, không dùng `ESP_I2S`), `WiFi`/`WiFiClientSecure`, `esp_http_server`, `Preferences` (NVS), `mbedtls` (SHA1/base64 cho bắt tay WS). WebSocket tự viết ở `src/net/ws_client` — core không kèm `esp_websocket_client`.
 
 ### Máy build — trạng thái thực tế
 
@@ -127,7 +135,8 @@ Mốc so sánh kích thước — lệch nhiều so với nó thì có gì đó 
 | **+ ADPCM hai chiều** (2026-08-15) | **1252187 byte (39%)** | **70800 byte (21%)** |
 | **+ chọn đường phát theo byte thật** (2026-08-16) | **1252939 byte (39%)** | **70800 byte (21%)** |
 | **+ pipeline 4 bước, đẩy ảnh sớm, cue** (2026-08-18) | 1291647 byte (41%) | 77192 byte (23%) |
-| **+ ADPCM theo luồng, bỏ IPv6, gom miếng 4 KB** (2026-08-19) | **1290595 byte (41%)** | **77328 byte (23%)** |
+| **+ ADPCM theo luồng, bỏ IPv6, gom miếng 4 KB** (2026-08-19) | 1290595 byte (41%) | 77328 byte (23%) |
+| **WS `/v2/session`, 31 cue clip trong flash, live, bỏ HTTP/MP3** (2026-10-20) | **1488535 byte (47%)** | **84880 byte (25%)** |
 
 Tra tên tuỳ chọn khác của board: `arduino-cli board details -b esp32:esp32:esp32s3`.
 
@@ -150,34 +159,42 @@ Tra tên tuỳ chọn khác của board: `arduino-cli board details -b esp32:esp
 | [README.md](README.md) | giới thiệu project |
 | [HUONG_DAN_MKE_M21_4G.md](HUONG_DAN_MKE_M21_4G.md) | hướng dẫn module 4G MKE-M21 — **nhánh riêng, chưa nằm trong luồng chính** |
 | [test/](test/) | sketch thử độc lập: `Test_MKE_M21`, `Test_MKE_M21_PPP`. Arduino **không** biên dịch thư mục này cùng sketch chính (chỉ `src/` mới được biên dịch đệ quy) |
-| `VisionCare.zip` | bản đóng gói cũ — không phải nguồn, đừng sửa |
+| [FIRMWARE_ENDPOINTS.md](FIRMWARE_ENDPOINTS.md) | **hợp đồng WS với server** (nguồn sự thật) |
+| `cues/` | bản sao bộ cue clip của server + `manifest.json` |
+| [tools/](tools/) | `gen_cue_clips.py` (cues/ → `src/audio/cue_clips_data.h`), `nap_token.ps1` (.env → NVS qua Serial) |
+| `.env` | token kính — **không commit** (đã có trong `.gitignore`) |
 
 ### `src/camera/`
 | File | Việc |
 |---|---|
 | [camera_device](src/camera/camera_device.h) | dựng `camera_config_t`, `cameraStart()/cameraReinit()/cameraIsReady()`. **Nguồn duy nhất** của frame size + JPEG quality |
 | [camera_tuning](src/camera/camera_tuning.h) | profile cảm biến cho OCR, `cameraWarmUp()`, in setting. Mọi lý do "vì sao đặt số này" nằm trong `.cpp` |
-| [camera_capture](src/camera/camera_capture.h) | `photoCapture()` chụp một LOẠT rồi giữ khung nét nhất vào PSRAM; đèn chiếu sáng; `photoMeasureSharpness()` (~200 ms, chỉ dùng khi chẩn đoán) |
+| [camera_capture](src/camera/camera_capture.h) | `photoCapture()` chụp một LOẠT rồi giữ khung nét nhất vào PSRAM (khoá camera, ép về HD, bỏ khung sót của live); đèn chiếu sáng; `photoMeasureSharpness()` |
+| [camera_live](src/camera/camera_live.h) | task "live": `liveCam()` chụp liên tục theo fps, `liveCapture()` một ảnh, `liveStop()`, `liveOnPress()` (chỉ dừng OCR, nav sống qua lượt mới). Gửi qua hàm `send` được truyền vào — không biết WS |
+
+`camera_device` còn có `cameraLock()/cameraSetMode()/cameraUseDefault()`: camera init ở **UXGA** để cấp frame buffer đủ lớn cho `capture uxga`, rồi hạ về HD ngay.
 
 ### `src/net/`
 | File | Việc |
 |---|---|
-| [wifi_manager](src/net/wifi_manager.h) | `wifiConnect()`, `wifiSelfTest()` (Wi-Fi → DNS → TCP/TLS) |
-| [http_body_reader](src/net/http_body_reader.h) | `BodyReader` đọc thân HTTP cả `Content-Length` lẫn `chunked` |
-| [api_client](src/net/api_client.h) | `apiSendCapture()` — TLS, dựng multipart, đọc status + header. **Không phát gì ra loa**, trả `ApiReply` để người gọi tự đọc thân |
+| [wifi_manager](src/net/wifi_manager.h) | `wifiConnect()`, `wifiSelfTest()` (Wi-Fi → DNS → TCP/TLS; bỏ qua chặng TLS nếu RAM nội liền < 50 KB) |
+| [ws_client](src/net/ws_client.h) | WebSocket RFC 6455 tối giản trên `WiFiClientSecure`: upgrade + kiểm `Sec-WebSocket-Accept`, khung gửi có byte loại, cắt khung nhận thành miếng, tự trả ping/close. Không thread-safe — chỉ task "wssess" gọi |
+| [device_session](src/net/device_session.h) | giao thức server: hello/hello_ok, ping, backoff, mã đóng, parse JSON phẳng, hàng gửi có thứ tự, ô khung live |
+| [device_token](src/net/device_token.h) | token trong NVS (`Preferences`, namespace `visioncare`). Không bao giờ in ra |
 
 ### `src/audio/`
 | File | Việc |
 |---|---|
 | [audio_i2s](src/audio/audio_i2s.h) | mở kênh I2S full-duplex, `i2sSetSampleRate()`, `i2sWriteSilence()` |
-| [audio_buffers](src/audio/audio_buffers.h) | `recBuf[]` (thu) + `sendBuf[]` (WAV ADPCM dựng sẵn để POST) + `stageBuf[]` (phát) — xin MỘT lần lúc khởi động, giữ đến khi tắt máy |
+| [audio_buffers](src/audio/audio_buffers.h) | `recBuf[]` (thu) + `sendBuf[]` (ADPCM thô gửi 0x03) + `stageBuf[]` (512 KB cho play_queue) — xin MỘT lần lúc khởi động, giữ đến khi tắt máy |
 | [audio_recorder](src/audio/audio_recorder.h) | `recordWhileHeld()`, `measureNoiseOnly()` — chỉ đọc mic |
 | [audio_dsp](src/audio/audio_dsp.h) | làm việc TẠI CHỖ trên `recBuf[]`: `quietestRms()`, `highBandRms()`, `noiseGate()`, `normalizeRecording()` |
 | [adpcm_codec](src/audio/adpcm_codec.h) | IMA/DVI ADPCM 4-bit nén 4:1, dùng cho CẢ hai chiều. Thuần số nguyên, không cấp phát, không biết gì về HTTP/I2S |
-| [audio_format](src/audio/audio_format.h) | `wavHeader()`, `wavHeaderAdpcm()`, `parseAudioFormat()`, `readWavHeader()` — thuần số liệu, không đụng phần cứng |
-| [pcm_source](src/audio/pcm_source.h) | `PcmSource`: PCM thô lấy thẳng từ socket, hoặc giải nén ADPCM / MP3 (Helix) trước |
-| [audio_player](src/audio/audio_player.h) | `playPcmStream()` vừa nhận vừa phát, đệm tự điều chỉnh; `playTone()` để chẩn đoán |
-| [audio_service](src/audio/audio_service.h) | **điều phối** — file duy nhất biết trình tự nút → ảnh → tiếng → server → loa |
+| [audio_cues](src/audio/audio_cues.h) | `cueFind(id)` tra clip trong flash, `cueVersion()`, `cueError()` (bíp 400 Hz, không cần mạng) |
+| `cue_clips_data.h` | 31 clip của server dạng mảng C — **sinh bằng `python tools/gen_cue_clips.py`** từ `cues/` (kiểm sha256 theo manifest). Đừng sửa tay |
+| [play_queue](src/audio/play_queue.h) | một luồng ADPCM + mốc gắn vào vị trí (REPLY / CUE / REPLY_END) + hàng clip khẩn. Task mạng ghi, task audio đọc. `pqFlush()` CHỈ task audio gọi |
+| [audio_player](src/audio/audio_player.h) | `playerPump()` phát theo hàng: clip khẩn cắt ngang, cue đúng chỗ, preroll, giữ lại một khối để vuốt nhỏ cuối câu, báo `played`; `playTone()` để chẩn đoán |
+| [audio_service](src/audio/audio_service.h) | **điều phối** — file duy nhất biết trình tự nút → ảnh → tiếng → phiên WS → loa, và nối live ↔ camera |
 
 ### `src/web/`, `src/diag/`, `src/util/`
 | File | Việc |
@@ -185,12 +202,11 @@ Tra tên tuỳ chọn khác của board: `arduino-cli board details -b esp32:esp
 | [web_server](src/web/web_server.h) | cổng 80: `/`, `/capture`, `/status`, `/control`, `/bmp`, `/xclk`, `/reg`, `/greg`, `/pll`, `/resolution` · cổng 81: `/stream` (MJPEG) |
 | [web_index_html.h](src/web/web_index_html.h) | trang HTML nhúng (949 dòng, gzip trong mảng byte) |
 | [web_led](src/web/web_led.h) | LED onboard `LED_GPIO_NUM` chạy PWM, chỉnh qua `/control?var=led_intensity`. **Khác** đèn chiếu sáng của `camera_capture` |
-| [serial_console](src/diag/serial_console.h) | phân phối lệnh `c/m/t/w/s/n/r` |
+| [serial_console](src/diag/serial_console.h) | phân phối lệnh `=`/`v/p/b/c/m/t/w/s/n/r` |
 | [audio_diag](src/diag/audio_diag.h) | `diagSlotCompare()`, `diagSpeakerTone()`, `diagNoiseVsCamera()` |
 | [camera_diag](src/diag/camera_diag.h) | `diagCaptureTest()` chụp thử + đo độ nét |
 | [mem_alloc](src/util/mem_alloc.h) | `bigAlloc()` — **cửa duy nhất** cấp phát vài trăm KB, ưu tiên PSRAM rồi lui về RAM trong |
 | [perf_probe](src/util/perf_probe.h) | `perfBegin/perfMark/perfReport` đo từng chặng một lần bấm nút; `memReport()` tách **RAM nội** khỏi PSRAM (còn trống / khối liền lớn nhất / thấp nhất từng chạm). Chỉ ghi và in — gỡ hết lời gọi thì chương trình chạy y hệt |
-| `src/libhelix-mp3/` | bộ giải mã MP3 Helix chép từ ESP8266Audio (RCSL/RPSL). **Vendored — không sửa** |
 
 ---
 
@@ -199,17 +215,20 @@ Tra tên tuỳ chọn khác của board: `arduino-cli board details -b esp32:esp
 | Muốn đổi | File |
 |---|---|
 | Wi-Fi SSID / mật khẩu | [your-eyes-esp32-firmware.ino:37](your-eyes-esp32-firmware.ino#L37) |
-| Endpoint API, timeout mạng | [app_config.h:23-50](app_config.h#L23-L50) |
-| Chân GPIO I2S / nút / đèn | [app_config.h:76-101](app_config.h#L76-L101) |
-| Tần số thu, trần thời gian thu | [app_config.h:109-113](app_config.h#L109-L113) |
-| XCLK camera | [app_config.h:74](app_config.h#L74) |
+| Endpoint WS, công tắc TLS/LAN | [app_config.h:22-57](app_config.h#L22-L57) |
+| Token kính | NVS — `tools/nap_token.ps1` hoặc lệnh `=` |
+| Bộ cue clip | `cues/` rồi `python tools/gen_cue_clips.py` |
+| Chân GPIO I2S / nút / đèn | [app_config.h:83-108](app_config.h#L83-L108) |
+| Tần số thu, trần thời gian thu | [app_config.h:121-124](app_config.h#L121-L124) |
+| XCLK camera | [app_config.h:81](app_config.h#L81) |
 | Model camera | [board_config.h:16](board_config.h#L16) |
 | Độ phân giải / chất lượng JPEG / profile cảm biến | `src/camera/camera_device.cpp` + `camera_tuning.cpp` |
 | Ngưỡng lọc ồn, độ khuếch đại bản thu | `src/audio/audio_dsp.cpp` |
 | Kích thước khối ADPCM (đánh đổi chống lỗi ↔ phí 4 byte/khối) | `src/audio/adpcm_codec.h` — `ADPCM_BLOCK_BYTES` |
-| Bỏ ADPCM, quay về gửi PCM thô | `encodeRecording()` trong `src/audio/audio_service.cpp` — chỗ duy nhất |
-| Mức đệm khi phát, chống hụt | `src/audio/audio_player.cpp` |
-| Trình tự một lần bấm nút | `src/audio/audio_service.cpp` |
+| Preroll, chờ khối trễ, âm lượng phát | `src/audio/audio_player.cpp` |
+| Ping, backoff, timeout hello, cỡ miếng tiếng gửi | `src/net/device_session.cpp` |
+| Hạn chờ reply, tự khởi động lại khi hết RAM TLS | `src/audio/audio_service.cpp` |
+| Trình tự một lượt, nối live ↔ camera | `src/audio/audio_service.cpp` |
 
 **Quy ước:** `app_config.h` chỉ chứa thứ dùng chung nhiều khối. Các nút vặn riêng của một khối nằm ngay trong `.cpp` của khối đó, cạnh dòng mã dùng tới nó — đừng kéo lên `app_config.h`.
 
@@ -223,15 +242,13 @@ Tra tên tuỳ chọn khác của board: `arduino-cli board details -b esp32:esp
 - **Bật I2S TX mà không ghi gì vào = loa RÈ TO liên tục.** Đệm DMA TX sâu `dma_desc_num × dma_frame_num` = 8 × 480 = **240 ms**, và lúc vừa `i2s_channel_enable()` thì nó rỗng; `auto_clear = true` không cứu được. Phải **mồi đầy** ~400 ms im lặng ngay sau khi enable, rồi mới duy trì đều. 🔴 Chỉ làm vế duy trì mà bỏ vế mồi thì **vẫn rè** — ghi bù 32 ms mỗi 32 ms đúng bằng tốc độ DMA tiêu thụ, nên bộ đệm không bao giờ đầy lên, cứ lơ lửng ở mức cạn và liên tục chạm đáy.
 - **🔴 `pgm_read_word()` phá nát mọi PCM nhúng trong flash.** Nó trả `uint16_t`, nên mẫu `-1` (`0xFFFF`) thành `65535` — nửa âm của dạng sóng bị lật thành số dương khổng lồ. Triệu chứng: tiếng vừa **rè** vừa **gần như không ra tiếng nói**, dù biên độ trong file hoàn toàn bình thường. Trên ESP32 `PROGMEM` vốn vô nghĩa (flash ánh xạ thẳng vào không gian địa chỉ) — đọc mảng như RAM là đúng: `int32_t v = ARR[i];`. Chỉ chép nguyên mẫu code AVR sang mới dính.
 - **Tách lỗi phần cứng khỏi lỗi dữ liệu ở đường loa bằng một sin 1 kHz sinh thẳng ra `int16_t`, biên độ ~28000.** Nghe to và trong thì amp/loa/nguồn đều tốt, lỗi nằm ở dữ liệu hoặc mức; nghe nhỏ hoặc rè thì mới đi soi `SD_MODE`, nguồn amp, dây loa. Không có phép thử này thì "nhỏ" và "hỏng" nhìn giống hệt nhau.
-- **Server trả WAV 48 kHz, mic thu 16 kHz** → đổi sample rate hai lượt **mỗi lần bấm**, không phải trường hợp hiếm. Bảo server trả 16 kHz thì bỏ được cả hai lượt.
-- **ADPCM: chỉ số bước (`stepIndex`) mang XUYÊN qua các khối lúc NÉN, chỉ `pred` mới đặt lại.** Đặt lại chỉ số về 0 mỗi 505 mẫu nghĩa là cứ 32 ms lại có một đoạn phải leo từ bước 7 lên mức tín hiệu thật — nghe thành tiếng lao xao đều đều. Khối vẫn tự giải mã độc lập được vì bộ giải đọc chỉ số từ phần đầu khối chứ không suy ra từ khối trước. ffmpeg cũng làm đúng vậy.
-- **🔴 Bên NÉN phải tái dựng lại mẫu y hệt cách bên GIẢI sẽ làm, rồi lấy kết quả đó làm mốc cho mẫu kế tiếp** — không được lấy mẫu gốc. Lấy mẫu gốc thì sai số mỗi mẫu không bao giờ được bù, nó cộng dồn suốt 505 mẫu của khối và tiếng trôi hẳn khỏi đường bao.
-- **`ffmpeg` KHÔNG cắt theo khối `fact`.** Đo được: 32000 mẫu vào → 32320 mẫu ra, tức nó trả nguyên cả phần đệm của khối cuối. Nên phần đệm phải tự nó vô hại: đệm bằng `0x08` (nibble thấp 8 = lùi bước/8, nibble cao 0 = tiến bước/8, triệt tiêu nhau) chứ không phải `0x00` — đệm toàn 0 thì mọi mẫu tiến một chiều, cộng dồn thành một bước DC ở cuối bản thu.
-- **`nAvgBytesPerSec` của ta (8110) khác ffmpeg (16000) và ta đúng.** ffmpeg lấy `bit_rate/8` chứ không tính lại. Đã đo: ffmpeg vẫn đọc file của ta bình thường, vì mọi bộ giải mã đều lấy `blockAlign` + `wSamplesPerBlock` chứ không lấy trường này. Đừng "sửa" cho khớp ffmpeg.
-- **Không có trình biên dịch host trên máy này** (`gcc`/`g++`/`clang`/`cl` đều không có) — nhưng CÓ `ffmpeg` và `python`. Cách kiểm chứng codec đã dùng, còn dùng lại được: chuyển ngữ thuật toán sang Python rồi đối chiếu hai chiều với ffmpeg. Bộ giải của ta trên bitstream ffmpeg phải **bit-exact** (đo được: 0/32320 mẫu lệch); ffmpeg đọc file ta nén phải ra **SNR ~37 dB**.
-- **🔴 Đường phát chọn theo BYTE THẬT của thân, không theo HTTP header.** ADPCM không có mẫu đồng bộ — ranh giới khối hoàn toàn do `blockAlign` và điểm bắt đầu quyết định. Lệch một chút là mọi khối lấy 4 byte giữa dữ liệu làm `pred`/`idx`. Đo được (ffmpeg + Python, [test/adpcm_check.py](test/adpcm_check.py) — chạy lại bằng `python test/adpcm_check.py`): giải đúng đường **SNR 35.1 dB**; đi nhầm nhánh "thô" nên nuốt luôn 60 byte header WAV → **−11.3 dB**; server dùng block 1024 mà board đinh ninh 256 → **−10.7 dB**. Cả hai ca sai đều là **nhiễu thuần**, nghe ra đúng là "loa rè, rất rè", và trước đây **không in ra một dòng nào**. `parseAudioFormat()` đặt `raw = true` chỉ vì THẤY header `x-audio-format` — nó không thể biết thân đóng gói kiểu gì. Nên `sendAndPlay()` ngó 4 byte đầu bằng `bodySniff()`: `"RIFF"` thì đọc như WAV bất kể header nói gì, và kêu lên khi hai bên bất đồng. Đừng đảo lại thành tin header.
-- **`BODY_GAP_MS = 30000`, không phải 8000.** Server sinh tiếng theo TỪNG CÂU; khoảng nghỉ giữa hai câu có thể vượt 8 s. Để nhỏ thì firmware tưởng hết luồng và **vứt mất phần còn lại của câu trả lời** — đã xảy ra đúng như vậy.
-- **Server xử lý ~40 giây thật.** `NET_TIMEOUT_MS = 90000`; Cloudflare tự ngắt ở 100 s (lỗi 524). Người dùng nhả nút rồi phải đợi ~40 s — giới hạn của server, board không nhanh hơn được.
+- **Đường HTTP `POST /process` cũ đã gỡ (2026-10-20).** Các bài học riêng của nó (đổi sample rate 48↔16 kHz mỗi lượt, chọn đường phát theo 4 byte `RIFF`, `BODY_GAP_MS`, đọc hết thân chunked trước khi giữ phiên keep-alive, `Expect: 100-continue`) nằm trong git history và [HUONG_DAN_SERVER.md](HUONG_DAN_SERVER.md). Trên WS chỉ có ADPCM 16 kHz khối 256 thô — không còn header nào để đọc nhầm.
+- **🔴 `pqFlush()` CHỈ task audio được gọi.** Task mạng xoá hàng giữa lúc task audio đang `pqRead()` thì vị trí đọc bị ghi lùi và đoạn cũ phát lại. Socket rớt → task mạng chỉ đặt cờ `s_dropAll`, task audio tự xoá.
+- **🔴 Reply của lượt CŨ phải bị chặn sau khi bấm lượt mới.** Server huỷ lượt cũ khi nhận `turn_start`, nhưng những gì nó đã gửi trước đó vẫn tới SAU `pqFlush()`. Chỉ chặn reply có id kính tự sinh (`t...`) mà không phải lượt hiện tại; `result-*` và câu nói của live phải đi qua.
+- **🔴 Nav live SỐNG qua lượt mới, OCR live thì không.** `liveOnPress()` chỉ dừng OCR. Dừng nhầm nav là tắt cảnh báo vật cản cho tới khi server gửi lại `cam` — tức không bao giờ, vì server tưởng nav vẫn chạy.
+- **Bấm không nói vẫn phải `turn_end`.** Với server này, bấm-nhả không lời khi đang phát nhạc/chỉ đường = "dừng" (spec mục 5.5). Đã bỏ ngưỡng `MIN_MS` cũ.
+- **Mask key WS = 0x00000000 là cố ý.** Hợp lệ cú pháp RFC, XOR với 0 không đổi nên không phải chép + xor 60 KB ảnh. Yêu cầu "khoá không đoán được" là chống đầu độc cache proxy từ JavaScript trình duyệt — không áp dụng cho kính.
+- **Hazard tới lúc đang GIỮ nút thì phát sau khi nhả.** Mic và loa chung một cụm I2S full-duplex; phát lúc đang thu thì mic thu luôn tiếng bíp gửi lên STT.
 - **`XCLK = 16 MHz` chứ không 20 MHz** vì cáp FPC 75 mm (dài gấp 3 cáp gốc, 8 đường song song không bọc chống nhiễu). Nhanh quá → vệt sọc ngang, `EV-EOF-OVF`, hoặc `esp_camera_init()` trả 0x105.
 - **Không gửi `Expect: 100-continue`.** Server không trả `100 Continue` → treo tới timeout. Board tự dựng header nên không dính; nhưng test bằng `curl` phải thêm `-H "Expect:"`.
 - **Không có vòng lặp vô hạn trong task audio.** Từng có chế độ chỉnh nét ống kính chờ ký tự Serial — nó chặn luôn task audio, nút mất tác dụng, nhìn ngoài giống hệt thiết bị hỏng. Đã bỏ.
@@ -252,43 +269,46 @@ Tra tên tuỳ chọn khác của board: `arduino-cli board details -b esp32:esp
 
 ## 6. API contract
 
+Nguồn sự thật: [FIRMWARE_ENDPOINTS.md](FIRMWARE_ENDPOINTS.md). Tóm tắt phần firmware dùng:
+
 ```
-POST https://api.visioncare-host.uk/process        (443, TLS)
-Content-Type: multipart/form-data
-Accept: audio/wav;codec=ima_adpcm, audio/mpeg, audio/wav   (ưu tiên giảm dần)
-  field "image" — capture.jpg,  image/jpeg
-  field "audio" — record.adpcm, audio/x-adpcm-ima; rate=16000; channels=1; block=256
-                  🔴 IMA/DVI ADPCM 4-bit mono 16 kHz, THÔ — KHÔNG có header
-                  RIFF. Header WAV phải đi trước dữ liệu nhưng ba trường của
-                  nó (RIFF size, data size, số mẫu `fact`) chỉ biết khi thu
-                  xong, tức buộc mọi byte phải đợi nhả nút. Bỏ header đi thì
-                  board nén và đẩy từng khối 256 B ngay trong lúc đang nói.
-                  Server dựng lại header: `adpcm.ensure_wav()`.
+WS wss://api.visioncare-host.uk/v2/session        (443, TLS; API_USE_TLS=0 → ws://<LAN>:8000)
+  một socket mỗi kính, GIỮ MỞ suốt; server accept trước rồi mới kiểm hello → luôn đọc MÃ ĐÓNG
 
-Trả về 200 — board nuốt được cả bốn, xếp theo thứ tự nên dùng:
-  audio/wav   fmt 0x0011  IMA ADPCM 4-bit mono   ← nhanh nhất, nên dùng
-  audio/mpeg                                     → giải mã bằng Helix
-  audio/wav   fmt 0x0001  PCM 16-bit
-  PCM/ADPCM thô kèm header:
-      x-audio-format: pcm_s16le;rate=16000;channels=1
-      x-audio-format: ima_adpcm;rate=16000;channels=1;block=256
+kính → server
+  text  {"t":"hello","device":"glasses-<mac>","token":"<NVS>","cue_version":2,"fw":"2.0.0","accept":"ima_adpcm"}
+  text  {"t":"ping"}                                   mỗi 25 s, kể cả lúc rảnh
+  text  {"t":"turn_start","turn":"t<boot>-<n>","t_press_ms":...}
+  bin   0x01 + JPEG (HD)                               ngay sau chụp, trong lúc đang nói
+  bin   0x03 + ADPCM thô (IMA 4-bit, 16 kHz, mono, khối 256, KHÔNG RIFF) từng ~1 KB
+  text  {"t":"turn_end","turn":...,"t_release_ms":...} kể cả khi bấm không nói (= "dừng")
+  bin   0x04 + JPEG                                    khung live, chỉ khi server bật live
+  text  {"t":"played","turn":...,"first_byte_ms":...,"first_audio_ms":...}
+
+server → kính
+  hello_ok · reply{turn,cues[],live,audio|null} · 0x02+ADPCM (bội số 256) · reply_end
+  hazard{level,dir,kind} · cue{id} · cam{size,fps,quality} · capture{size} · end · pong · error{code}
+  reply "result-*" do server chủ động đẩy — phát như mọi reply
+
+mã đóng   4000 phiên mới thay thế → KHÔNG tự mở lại · 4401 token sai → KHÔNG thử lại
+          4400/1009 lỗi firmware · 1001 im lặng 90 s · khác → backoff 0.5→1→2→4→8 s ±20%
 ```
-Nhánh `chunked` vẫn giữ làm dự phòng — Cloudflare có thể đổi bất cứ lúc nào.
 
-### Băng thông từng hướng
+Firmware khai `cue_version` = bản clip trong flash. Bằng server → server chỉ gửi mã cue, kính phát clip từ flash (không chờ mạng). Thấp hơn → server đọc cue thành tiếng.
 
-| Chặng | Trước | Sau ADPCM |
-|---|---|---|
-| Bản thu 10 s lên server | 320 044 B | **81 212 B** (25.4%) |
-| Câu trả lời về, mỗi giây tiếng | 96 KB/s (WAV 48k) | **8 KB/s** (ADPCM 16k) |
+### Token
+- Server đọc `VISIONCARE_DEVICE_CLIENT_TOKEN`. Kính giữ token trong **NVS**, không biên dịch cứng, không in ra log.
+- Nạp: `powershell -ExecutionPolicy Bypass -File tools\nap_token.ps1` (đọc `.env`, gửi `=<token>` qua COM8), hoặc gõ `=<token>` trong Serial Monitor. NVS sống qua mọi lần nạp firmware.
+- `.env` nằm trong `.gitignore` — **đừng commit**.
 
-Đường về mới là chỗ ăn tiền: [audio_player.cpp](src/audio/audio_player.cpp) so tốc độ nguồn với tốc độ phát rồi tự chọn mức đệm. Ở 96 KB/s nó thường rơi vào nhánh "nguồn chậm hơn tốc độ phát → đợi nhận xong rồi phát". Ở 8 KB/s biên độ dư lớn tới mức luôn rơi nhánh đệm 400 ms.
+### Cue clip
+- `cues/` = bản sao `assets/cues/` của repo server (31 clip, `cue_version` 2). Server đổi clip → chép lại → `python tools/gen_cue_clips.py` → biên dịch lại.
 
 ### Phía server phải làm gì
 
-Đọc bản thu: `ffmpeg -i record.wav -c:a pcm_s16le out.wav`, hoặc `soundfile.read()`. Không phải viết mã tay.
+Đọc bản thu: dữ liệu `0x03` ghép lại là ADPCM thô — `adpcm.ensure_wav()` dựng lại header rồi `ffmpeg`/`soundfile`.
 
-Trả câu trả lời: `ffmpeg -i tts.wav -ar 16000 -ac 1 -c:a adpcm_ima_wav -block_size 256 reply.wav`.
+Trả tiếng: `ffmpeg -i tts.wav -ar 16000 -ac 1 -c:a adpcm_ima_wav -block_size 256 reply.wav`, bỏ header, gửi khối data.
 
 🔴 **Đừng dùng `audioop.lin2adpcm()` / `adpcm2lin()` của Python.** Nó là biến thể riêng của Python — không có phần đầu khối 4 byte, không tương thích fmt tag 0x0011. Dùng ffmpeg hoặc soundfile.
 
@@ -298,15 +318,19 @@ Trả câu trả lời: `ffmpeg -i tts.wav -ar 16000 -ac 1 -c:a adpcm_ima_wav -b
 
 | Phím | Việc |
 |---|---|
+| `=<token>` | nạp token vào NVS (chỉ in độ dài), rồi mở lại phiên ngay |
+| `v` | trạng thái phiên WS: OFFLINE / CHO hello_ok / SAN SANG / 4000 / 4401 / chưa có token, số lần mở, mã đóng cuối |
+| `p` | giả lập một lượt giữ nút 3 giây — đi đúng đường turn_start → ảnh → tiếng → turn_end |
+| `b` | nghe thử tiếng báo lỗi |
 | `c` | chụp thử + đo độ nét, không gửi đi đâu |
 | `m` | nghe so sánh hai kiểu ghi khe I2S (đoán chế độ SD_MODE của amp) |
 | `t` | phát sin sạch tăng dần biên độ, đo méo tiếng bằng chính mic |
-| `w` | kiểm tra đường mạng theo chặng: Wi-Fi → DNS → TCP/TLS, rồi ép thử riêng IPv4 và IPv6 (chưa vào được mạng thì tự quét sóng thay) |
+| `w` | kiểm tra đường mạng theo chặng: Wi-Fi → DNS → TCP/TLS (bỏ qua TLS nếu RAM liền < 50 KB), ép thử IPv4/IPv6, rồi in trạng thái phiên |
 | `s` | quét mọi AP 2.4 GHz bắt được, đánh dấu cái trùng `WIFI_SSID` |
 | `n` | đo nền nhiễu khi camera BẬT và khi camera TẮT |
 | `r` | in bộ nhớ còn lại — RAM nội và PSRAM tách riêng, kèm khối liền lớn nhất |
 
-Ngoài ra **mỗi lần bấm nút** tự in bảng thời gian 9 chặng (chụp → thu → chờ nhả → lọc + nén ADPCM → DNS+TLS → upload → server nghĩ → tiếng đầu ra loa → phát hết) kèm phần trăm của tổng, rồi in bộ nhớ. Cột phần trăm trả lời "nên đi sửa chặng nào"; chặng `server nghĩ` là phần board không can thiệp được.
+Mỗi lượt bấm nút in bảng thời gian (turn_start → chụp → thu + nén + đẩy → chờ nhả → turn_end) rồi in bộ nhớ. Không có `reply` trong 15 s sau `turn_end` → kêu bíp lỗi.
 
 ---
 
