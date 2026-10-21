@@ -31,6 +31,14 @@ size_t recordWhileHeld(RecChunkFn onChunk);
 // mot lan bam nut binh thuong.
 size_t recordFixed(unsigned long ms, RecChunkFn onChunk);
 
+// Doc DUNG `samples` mau vao `dst` (chan toi khi du, ~32 ms cho 505 mau).
+// Tra ve so mau doc duoc — it hon `samples` chi khi mic hong/doi.
+//
+// Ly do ton tai: cuoc goi thu LIEN TUC khong co dieu kien dung, va moi vong
+// chi lay dung mot khoi ADPCM roi phat dung mot khoi — nhip doc mic chinh la
+// nhip cua ca vong song cong.
+size_t recordBlock(int16_t *dst, size_t samples);
+
 // Thu 1.5 giay im lang roi tra ve nen nhieu NGHE DUOC (da loc thong cao 76 Hz).
 // Dung cho phep thu A/B khi chan doan, khong gui di dau. Ham nay CO sua
 // recBuf[], nen dung goi khi dang giu mot ban thu can dung.

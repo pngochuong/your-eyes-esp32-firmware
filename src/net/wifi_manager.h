@@ -17,18 +17,6 @@ extern const char* WIFI_PASSWORD;
 // thoi gian cho. In day du dia chi IPv4 va IPv6 de con chan doan.
 bool wifiConnect(unsigned long timeoutMs);
 
-// Dia chi server ma wifiConnect() da CHUNG MINH la dung duoc — no khong chi
-// phan giai ra dia chi nay, no da bat tay TLS tron ven toi day roi.
-// Tra ve false neu chua co (chua noi mang, hoac moi chang deu hong).
-//
-// 🔴 Co ham nay vi mot lan tra gia (2026-08-18): wifiConnect() bat tay TLS OK
-// toi 104.21.67.134, roi api_client hoi DNS lai va nhan 172.67.176.233 — cai
-// thu hai bat tay TCP xong nhung TLS thi TREO VINH VIEN (15 giay cung khong
-// xong). Cloudflare tra nhieu IP cho mot ten mien va khong phai duong nao
-// cung cho qua goi full-size, nen dia chi da DUOC THU moi la dia chi dang tin.
-// Phan giai lai la tu nguyen bo bang chung da mua bang 3 giay bat tay.
-bool wifiProvenServerIp(IPAddress &out);
-
 // Kiem tra duong mang theo tung chang: WiFi -> DNS -> TCP/TLS toi API_HOST.
 // Khong chup, khong thu, khong gui — chi de biet hong o chang nao. Neu chua
 // vao duoc mang thi quet song thay cho ba chang do.

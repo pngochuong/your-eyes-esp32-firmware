@@ -86,6 +86,24 @@ size_t recordFixed(unsigned long ms, RecChunkFn onChunk) {
   return got;
 }
 
+size_t recordBlock(int16_t *dst, size_t samples) {
+  size_t want = samples * sizeof(int16_t), got = 0, n;
+  // Ba lan timeout lien la mic da dung — tra ve phan co, de vong goi khong
+  // treo cung voi no.
+  for (int miss = 0; got < want && miss < 3;) {
+    n = 0;
+    esp_err_t e = i2s_channel_read(i2sRx, (uint8_t *)dst + got, want - got, &n,
+                                   100 / portTICK_PERIOD_MS);
+    got += n;
+    if (e == ESP_ERR_TIMEOUT) { miss++; continue; }
+    if (e != ESP_OK) {
+      Serial.printf("LOI read: %s\n", esp_err_to_name(e));
+      break;
+    }
+  }
+  return got / sizeof(int16_t);
+}
+
 // Thu 1.5 giay im lang roi tra ve nen nhieu NGHE DUOC (da loc thong cao 76 Hz).
 // Dung cho phep thu A/B, khong gui di dau. Khong dung recBuf[] cho viec khac
 // trong luc nay — chap nhan duoc vi chi chay khi go lenh chan doan.

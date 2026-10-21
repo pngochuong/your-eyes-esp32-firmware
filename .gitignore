@@ -1,0 +1,6 @@
+# Token cua kinh — KHONG duoc commit (FIRMWARE_ENDPOINTS muc 2). Nap vao board
+# bang tools/nap_token.ps1.
+.env
+
+# San pham build cua arduino-cli
+build/

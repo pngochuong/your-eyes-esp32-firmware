@@ -9,45 +9,55 @@
 #include "audio_service.h"
 
 #include <WiFi.h>
+#include <esp_heap_caps.h>
+#include <esp_random.h>
 
 #include "adpcm_codec.h"
 #include "audio_buffers.h"
 #include "audio_cues.h"
 #include "audio_dsp.h"
-#include "audio_format.h"
 #include "audio_i2s.h"
 #include "audio_player.h"
 #include "audio_recorder.h"
-#include "pcm_source.h"
+#include "play_queue.h"
 #include "../camera/camera_capture.h"
+#include "../camera/camera_device.h"
+#include "../camera/camera_live.h"
 #include "../diag/serial_console.h"
-#include "../net/api_client.h"
+#include "../net/device_session.h"
 #include "../util/perf_probe.h"
 #include "../../app_config.h"
+
+// Bao lau sau turn_end ma chua co `reply` thi keu loi cho nguoi dung bam lai.
+// E2E do duoc: nha nut -> tieng dau 502-560 ms (FIRMWARE_ENDPOINTS muc 14).
+// 15 s du rong cho mang cham va lan server nghi lau, ma van du som de nguoi
+// dung khiem thi khong dung do khong biet may con song khong.
+static const unsigned long REPLY_TIMEOUT_MS = 15000;
+
+// Truoc khi dung lai bo dem anh/tieng cho luot moi, duong len cua luot cu phai
+// xong. Tren duong cham (hotspot 9 KB/s) anh 60 KB mat ~7 s; qua tran nay thi
+// bo luot moi va keu loi, khong ghi de bo dem dang duoc gui.
+static const unsigned long UPLINK_WAIT_MS = 8000;
+
+// 🔴 Khoi dong lai khi TLS khong bat tay noi vi het RAM noi LIEN.
+// Do that tren board (2026-08-27): mot phien mbedtls doi ~45 KB lien, va sau
+// khi httpd + audio da cap phat thi khoi lien lon nhat chi con 31-35 KB — phien
+// dau tien (mo luc khoi dong) chay duoc, nhung rot roi thi KHONG mo lai duoc nua
+// cho toi khi cam lai nguon. Voi thiet bi "bat nguon la chay", cam lai nguon la
+// viec nguoi dung khiem thi khong tu biet de lam. Nen tu lam, nhung chi khi:
+//   - mo hong lien tiep RESTART_FAILS lan (khong phai mot lan truot mang),
+//   - va khoi lien lon nhat that su duoi nguong (khong phai mang hong),
+//   - va dang ranh (khong giua luot, khong dang phat).
+#define RESTART_ON_TLS_STARVE  API_USE_TLS
+static const uint16_t RESTART_FAILS     = 6;
+static const size_t   TLS_MIN_BLOCK     = 48 * 1024;
 
 // ============================================================================
 // Nen ban thu thanh ADPCM va day len NGAY trong luc dang thu
 // ============================================================================
-// 🔴 Ban thu KHONG con la file WAV. Header WAV phai di truoc du lieu, ma ba
-// truong cua no (RIFF size, data size, so mau trong "fact") chi biet duoc khi
-// da thu xong — tuc phai doi nha nut roi moi gui duoc byte dau tien. Do that
-// tren hotspot 9 KB/s: 26 KB ADPCM cua mot cau 3 giay mat gan 3 giay day,
-// cong thang vao khoang nguoi dung ngoi cho.
-//
-// Bo header di thi khong con gi phai biet truoc: cu du 505 mau la nen ra mot
-// khoi 256 byte va giao ngay cho task mang. Luc nha nut chi con khoi cuoi.
-// Tham so codec di trong Content-Type cua phan multipart, server tu dung lai
-// header WAV neu no can.
-//
-// Dat o day chu khong o api_client: api_client lo duong MANG, no khong duoc
-// biet am thanh ma hoa kieu gi. Doi codec thi chi mot khoi nay doi.
-// ============================================================================
-
-// Nhan dan len phan "audio" cua multipart. Dung san mot lan luc khoi dong vi
-// no ghep tu SR va ADPCM_BLOCK_BYTES — hai hang so nam o hai file khac nhau,
-// va viet tay lai o day la mo duong cho chung lech nhau.
-static char g_audType[80];
-
+// Ban thu di len thanh khung 0x03 ADPCM THO, khong header RIFF (muc 10): cu du
+// 505 mau la nen ra mot khoi 256 byte va giao ngay cho task mang. Luc nha nut
+// chi con khoi cuoi.
 static AdpcmEnc g_enc;
 static size_t   g_encBytes = 0;   // so byte ADPCM da nen vao sendBuf
 static size_t   g_pendSamp = 0;   // mau dau tien cua recBuf CHUA duoc nen
@@ -67,8 +77,7 @@ static void encodeUpTo(size_t haveSamp, bool flush) {
   while (g_pendSamp < haveSamp) {
     size_t n = haveSamp - g_pendSamp;
     if (n > (size_t)ADPCM_BLOCK_SAMPLES) n = ADPCM_BLOCK_SAMPLES;
-    // Chua du mot khoi va cung chua thu xong -> de danh cho lan sau. Nen som
-    // mot khoi cut la tu nguyen vut di ty so nen cua 505 mau.
+    // Chua du mot khoi va cung chua thu xong -> de danh cho lan sau.
     if (n < (size_t)ADPCM_BLOCK_SAMPLES && !flush) break;
 
     if (g_encBytes + ADPCM_BLOCK_BYTES > sendCap) {
@@ -79,367 +88,524 @@ static void encodeUpTo(size_t haveSamp, bool flush) {
                                    sendBuf + g_encBytes);
     g_pendSamp += n;
   }
-  apiPushAudio(g_encBytes, flush);
+  sessionAudioPush(g_encBytes, flush);
 }
 
 // Ham goi lai cua recordWhileHeld()/recordFixed(): loc roi nen ngay mieng vua
-// doc duoc. Chay TRONG task audio, giua hai lan doc mic — vai tram micro giay
-// cho mot mieng 32 ms, khong lam cham viec thu.
+// doc duoc, giua hai lan doc mic.
 static void onRecChunk(size_t from, size_t count) {
   dspStreamPrep(from, count);
   encodeUpTo(from + count, false);
 }
 
-// Nen not phan le sau khi nha nut, roi dong phan "audio" lai. Tra ve tong so
-// byte da gui.
 static size_t encodeFinish(size_t pcmBytes) {
   encodeUpTo(pcmBytes / sizeof(int16_t), true);
-  Serial.printf("Nen ADPCM: %u -> %u byte (con %.0f%%), khoi cuoi %u byte\n",
-                (unsigned)pcmBytes, (unsigned)g_encBytes,
-                pcmBytes ? 100.0 * g_encBytes / pcmBytes : 0.0,
-                (unsigned)(g_encBytes ? ADPCM_BLOCK_BYTES : 0));
+  Serial.printf("Nen ADPCM: %u -> %u byte\n", (unsigned)pcmBytes, (unsigned)g_encBytes);
   return g_encBytes;
 }
 
 // ============================================================================
-// Gui len server roi phat cau tra loi
+// Handler cua phien — chay trong task "wssess", chi xep hang
 // ============================================================================
-// api_client lo phan mang, audio_player lo phan loa. Ham nay chi chon duong:
-// than tra ve la MP3, ADPCM, PCM tho, hay WAV PCM.
-static bool waitAndPlay() {
-  ApiReply reply;
-  if (!apiWaitReply(reply, FIRST_AUDIO_MS)) return false;
+// Luot dang cho tra loi. Task audio ghi s_waitTurn TRUOC khi gui turn_start,
+// nen luc reply toi thi chuoi da on dinh.
+static char          s_waitTurn[24] = "";
+static volatile bool s_waiting      = false;
+static volatile bool s_gotReply     = false;
+static volatile bool s_rejected     = false;   // error rate_limited cho luot nay
+static volatile bool s_lost         = false;   // socket rot giua luc cho
+static unsigned long s_waitSince    = 0;
 
-  bool played;
+// 🔴 Socket rot thi phai bo moi tieng dang cho — nhung pqFlush() chi duoc chay
+// tren task DOC (task audio): neu task mang xoa giua luc task audio dang
+// pqRead() thi vi tri doc bi ghi lui va doan cu phat lai. Nen task mang chi
+// dat co, task audio tu xoa.
+static volatile bool s_dropAll = false;
 
-  PcmSource src = {};
-  src.body = &reply.body;
+// Moc first_byte_ms cua reply dang nhan (task mang ghi va doc).
+static unsigned long s_firstByte = 0;
 
-  // 🔴 Chon duong phat theo BYTE THAT cua than, khong theo HTTP header.
-  //
-  // Da do bang ffmpeg + Python: bo giai ma ADPCM dung — SNR 35 dB tren
-  // bitstream cua ffmpeg, ca khoi 256 lan 1024, va khong xau di khi socket nha
-  // vun. Nhung neu di NHAM sang nhanh "tho" trong khi than lai la file WAV thi
-  // 60 byte header bi an nhu du lieu nen: moi khoi lech ke tu do, SNR tut
-  // xuong -11 dB, tuc nhieu thuan. Tai nghe ra dung la "loa re rat re" — ma
-  // khong mot dong log nao bao, vi khong ai doi chieu header voi than.
-  //
-  // parseAudioFormat() dat raw = true chi vi THAY header x-audio-format, no
-  // khong the biet than dong goi kieu gi. Bon byte dau thi biet: "RIFF" la
-  // file WAV, khong the la du lieu ADPCM tho.
-  uint8_t magic[4] = { 0, 0, 0, 0 };
-  bool isRiff = bodySniff(reply.body, magic, 4) && !memcmp(magic, "RIFF", 4);
+// 🔴 Khung cua luot CU con dang bay khi nguoi dung bam lan moi. Server huy luot
+// cu khi nhan turn_start, nhung nhung gi no da gui TRUOC do van toi kinh SAU
+// pqFlush() — khong chan thi cau tra loi cu phat chen vao sau cau hoi moi.
+// Chi chan reply cua luot do KINH dat id (bat dau bang 't') ma khong phai luot
+// hien tai; `result-*` va cau noi cua live van phai di qua.
+static char          s_curTurn[24] = "";
+static volatile bool s_skipping    = false;
 
-  if (isRiff && reply.fmt.raw) {
-    Serial.println("CANH BAO: header x-audio-format bao du lieu THO, nhung than "
-                   "bat dau bang 'RIFF'.");
-    Serial.println("  Theo than — doc nhu file WAV. Server nen bo header do, "
-                   "hoac tra du lieu tho that su.");
+// `reply.live` cua reply gan nhat — quyet dinh `cam` ke tiep la OCR hay nav.
+static volatile LiveKind s_pendingLive = LIVE_NONE;
+
+// ---- cuoc goi (muc 16). Task mang ghi theo `call_state`, task audio doc de
+// biet nut bam nghia la gi va khi nao vao vong song cong.
+enum CallSt : uint8_t { CALL_NONE, CALL_RING_IN, CALL_RING_OUT, CALL_ACTIVE };
+static volatile CallSt s_call = CALL_NONE;
+static char            s_callId[64] = "";
+static portMUX_TYPE    s_callMux = portMUX_INITIALIZER_UNLOCKED;
+// Kinh vua gui call_hangup. Server chua kip xu ly thi van gui tieng cuoc goi
+// them mot nhip — bo di, va khong quay lai vong goi cho toi khi server bao
+// trang thai moi. Co han: server khong tra gi thi sau HANGUP_MUTE_MS nghe lai.
+static volatile bool   s_hangupSent = false;
+static unsigned long   s_hangupAt   = 0;
+static const unsigned long HANGUP_MUTE_MS = 3000;
+
+static bool hangupMuting() {
+  return s_hangupSent && millis() - s_hangupAt < HANGUP_MUTE_MS;
+}
+
+static void hReady() {
+  Serial.println("San sang — giu nut de hoi");
+}
+
+static void hDown() {
+  // Muc 1, buoc 16: dung phat, tat camera live, bo luot do dang.
+  s_dropAll  = true;
+  s_skipping = false;
+  liveStop();
+  if (s_waiting) s_lost = true;
+  // Muc 16.2: rot phien thi server cup cuoc goi thuong. Chuoi khan cap van
+  // chay — server gui lai `call_state` ngay sau hello_ok, luc do moi vao lai.
+  s_call       = CALL_NONE;
+  s_hangupSent = false;
+}
+
+static void hReply(const SessionReply &r) {
+  bool ours  = r.turn[0] == 't';            // id kinh tu sinh: "t%04x-%lu"
+  s_skipping = ours && strcmp(r.turn, s_curTurn) != 0;
+  if (s_skipping) {
+    Serial.printf("<< reply %s cua luot cu — bo\n", r.turn);
+    return;
   }
+  if (s_waiting && strcmp(r.turn, s_waitTurn) == 0) s_gotReply = true;
+  Serial.printf("<< reply %s: cue [", r.turn);
+  for (int i = 0; i < r.nCues; i++) Serial.printf("%s%s", i ? " " : "", r.cues[i]);
+  Serial.printf("], live=%s, audio=%s\n",
+                r.live[0] ? r.live : "null", r.hasAudio ? "co" : "khong");
 
-  if (reply.isMp3) {
-    // MP3: giai ma truoc khi vao duong phat. Bang thong chi con 1/8 so voi
-    // PCM tho, nen day moi la duong khong con bi khung.
-    if (!mp3Init(src)) { apiClose(reply); return false; }
+  if (!strcmp(r.live, "ocr"))      s_pendingLive = LIVE_OCR;
+  else if (!strcmp(r.live, "nav")) s_pendingLive = LIVE_NAV;
 
-    // Giai KHUNG DAU truoc de biet tan so va so kenh — hai thu do nam trong
-    // chinh khung MP3, khong co header rieng nhu WAV.
-    // Gan tung truong chu khong dung danh sach khoi tao: AudioFmt da them
-    // truong `adpcm` o vi tri 2, nen `{ false, 0, 0, 16 }` am tham thanh
-    // ch = 16, bits = 0. Lan nay khong hai vi ca hai bi ghi de ngay ben duoi,
-    // nhung mot cai bay im lang thi khong dang giu lai.
-    AudioFmt mf = {};
-    mf.bits = 16;
-    unsigned long tw = millis();
-    while (millis() - tw < (unsigned long)FIRST_AUDIO_MS) {
-      int n = mp3DecodeFrame(src);
-      if (n < 0) break;
-      if (n > 0) {
-        MP3FrameInfo fi;
-        MP3GetLastFrameInfo(src.dec, &fi);
-        mf.rate = (uint32_t)fi.samprate;
-        mf.ch   = (uint16_t)fi.nChans;
-        src.outLen = (size_t)n;      // giu lai khung nay, khong vut di
-        src.outPos = 0;
-        Serial.printf("MP3: %d Hz, %d kenh, %d kbps\n",
-                      fi.samprate, fi.nChans, fi.bitrate / 1000);
-        break;
-      }
-      vTaskDelay(5 / portTICK_PERIOD_MS);
-    }
+  s_firstByte = 0;
+  PqEvent e = {};
+  e.type        = PQ_REPLY;
+  e.hasAudio    = r.hasAudio;
+  e.prerollMs   = r.prerollMs;
+  e.firstByteMs = millis();
+  strncpy(e.turn, r.turn, sizeof(e.turn) - 1);
+  pqPushEvent(e);
 
-    if (mf.rate == 0 || (mf.ch != 1 && mf.ch != 2)) {
-      Serial.println("Khong giai duoc khung MP3 dau tien");
-      mp3Free(src);
-      apiClose(reply);
-      return false;
-    }
-
-    src.isMp3 = true;
-    played = playPcmStream(src, mf, 0);
-    mp3Free(src);
-  } else if (!isRiff && reply.fmt.raw && reply.fmt.adpcm) {
-    // ADPCM tho, dinh dang bao qua x-audio-format. Khong biet tong do dai.
-    if (!adpcmInit(src, reply.fmt)) { apiClose(reply); return false; }
-    src.isAdpcm = true;
-    Serial.printf("ADPCM tho: %u Hz, khoi %u byte -> %u mau\n",
-                  (unsigned)reply.fmt.rate, reply.fmt.blockAlign,
-                  reply.fmt.samplesPerBlock);
-    played = playPcmStream(src, reply.fmt, 0);
-    adpcmFree(src);
-  } else if (!isRiff && reply.fmt.raw) {
-    // Co x-audio-format => PCM tho, khong header. Nhung cung khong biet tong
-    // do dai, nen khi nguon cham chi con cach doi nhan het.
-    played = playPcmStream(src, reply.fmt, 0);
-  } else {
-    // WAV: doc header ngay tren luong. Vai chuc byte dau, khong ton thoi gian,
-    // doi lai biet duoc TONG DO DAI — nho do tinh duoc thoi diem som nhat
-    // van phat lien mach duoc, thay vi doi het ca file.
-    AudioFmt wf;
-    size_t   dataLen = 0;
-    if (!readWavHeader(reply.body, wf, &dataLen)) {
-      Serial.println("Than tra ve khong phai WAV PCM 16-bit / IMA ADPCM hop le");
-      // In bon byte dau. Khong co no thi "than hong" va "board doc nham kieu
-      // dong goi" nhin giong het nhau — ma hai cai sua o hai dau khac han.
-      Serial.printf("  4 byte dau than: %02X %02X %02X %02X  '%c%c%c%c'\n",
-                    magic[0], magic[1], magic[2], magic[3],
-                    isprint(magic[0]) ? magic[0] : '.',
-                    isprint(magic[1]) ? magic[1] : '.',
-                    isprint(magic[2]) ? magic[2] : '.',
-                    isprint(magic[3]) ? magic[3] : '.');
-      apiClose(reply);
-      return false;
-    }
-
-    // 🔴 playPcmStream() do "nguon day duoc bao nhieu byte/giay" tren so byte
-    // pcmRead() TRA RA, tuc byte da giai nen. Nen tong do dai truyen vao cung
-    // phai la so byte SAU giai nen — dua thang do dai khoi "data" cua file
-    // ADPCM vao la lech 4 lan, no tuong cau ngan bang 1/4 va phat qua som.
-    size_t totalPcm = dataLen;
-    if (wf.adpcm && dataLen && wf.blockAlign && wf.samplesPerBlock) {
-      size_t blocks = (dataLen + wf.blockAlign - 1) / wf.blockAlign;
-      totalPcm = blocks * wf.samplesPerBlock * sizeof(int16_t);
-    }
-
-    Serial.printf("WAV %s: %u Hz, %u kenh, PCM %s byte\n",
-                  wf.adpcm ? "IMA ADPCM 4-bit" : "16-bit",
-                  (unsigned)wf.rate, wf.ch,
-                  totalPcm ? String((unsigned)totalPcm).c_str() : "khong bao truoc");
-
-    if (wf.adpcm) {
-      if (!adpcmInit(src, wf)) { apiClose(reply); return false; }
-      src.isAdpcm = true;
-    }
-    played = playPcmStream(src, wf, totalPcm);
-    if (wf.adpcm) adpcmFree(src);
+  // Cue phat tu flash NGAY tai day trong luong — truoc moi khoi 0x02 cua reply
+  // nay, vi reply luon toi truoc khoi cua no (muc 1, buoc 11).
+  for (int i = 0; i < r.nCues; i++) {
+    PqEvent c = {};
+    c.type = PQ_CUE;
+    strncpy(c.cue, r.cues[i], sizeof(c.cue) - 1);
+    pqPushEvent(c);
   }
-  apiClose(reply);
-  perfMark("phat het cau");
+}
 
-  // 🔴 Moc nay gio la luc BAT DAU day anh, khong con la luc gui xong. Anh di
-  // trong khi nguoi dung con dang noi, nen "gui xong" khong con la mot thoi
-  // diem duy nhat de lay lam goc.
-  Serial.printf("Tron mot lan: %lu ms ke tu luc bat dau day anh\n",
-                millis() - reply.tStart);
-  return played;
+static void hAudio(const uint8_t *p, size_t n) {
+  if (s_skipping || hangupMuting()) return;
+  if (!s_firstByte) s_firstByte = millis();
+  pqPushAudio(p, n);
+}
+
+static void hReplyEnd(const char *turn) {
+  if (s_skipping) { s_skipping = false; return; }
+  PqEvent e = {};
+  e.type        = PQ_REPLY_END;
+  e.firstByteMs = s_firstByte;
+  strncpy(e.turn, turn, sizeof(e.turn) - 1);
+  pqPushEvent(e);
+  s_firstByte = 0;
+}
+
+static void hHazard(int level, const char *dir, const char *kind) {
+  // Muc 6: phat hazard_<level>; muc >= 2 them dir_*, muc 3 them stop_now.
+  // Server da chong lam phien — kinh phat MOI khung nhan duoc.
+  if (level < 1) level = 1;
+  if (level > 3) level = 3;
+  Serial.printf("<< HAZARD muc %d, %s, %s\n", level, dir, kind);
+  char id[24];
+  snprintf(id, sizeof(id), "hazard_%d", level);
+  pqUrgent(id);
+  if (level >= 2 && dir[0]) {
+    snprintf(id, sizeof(id), "dir_%s", dir);
+    pqUrgent(id);
+  }
+  if (level >= 3) pqUrgent("stop_now");
+}
+
+static void hCue(const char *id) {
+  // Cue cua live (huong dan can chu) — keu ngay, khong xep sau cau dang doc.
+  pqUrgent(id);
+}
+
+static void hCam(const char *size, int fps, int quality) {
+  // `cam` dau tien sau mot reply co live -> dung kieu reply do noi. Nhung
+  // `cam` sau do (OCR xong, server tu dung lai nav) khong co reply nao di
+  // kem — doan theo kich thuoc: nav chay qvga, OCR chay vga (muc 6).
+  LiveKind k = s_pendingLive;
+  s_pendingLive = LIVE_NONE;
+  if (k == LIVE_NONE) k = (!strcasecmp(size, "qvga") || !strcasecmp(size, "qqvga")) ? LIVE_NAV : LIVE_OCR;
+  liveCam(k, cameraParseSize(size, FRAMESIZE_VGA), fps, quality);
+}
+
+static void hCapture(const char *size) {
+  liveCapture(cameraParseSize(size, FRAMESIZE_UXGA));
+}
+
+static void hLiveEnd() {
+  liveStop();
+}
+
+static void hError(const char *code) {
+  if (!strcmp(code, "rate_limited")) {
+    // Muc 11: bao bang cue cuc bo, khong thu lai don dap. Luot vua gui bi bo.
+    pqUrgent("system_busy");
+    if (s_waiting) s_rejected = true;
+  }
+}
+
+static void hCallState(const char *call, const char *state, const char *peer,
+                       const char *reason) {
+  CallSt st = !strcmp(state, "ringing_in")  ? CALL_RING_IN
+            : !strcmp(state, "ringing_out") ? CALL_RING_OUT
+            : !strcmp(state, "active")      ? CALL_ACTIVE
+            :                                 CALL_NONE;      // ended / la
+  if (call[0]) {
+    // Id co the doi tu id tam sang id that — luon giu cai moi nhat.
+    portENTER_CRITICAL(&s_callMux);
+    strncpy(s_callId, call, sizeof(s_callId) - 1);
+    s_callId[sizeof(s_callId) - 1] = 0;
+    portEXIT_CRITICAL(&s_callMux);
+  }
+  s_hangupSent = false;
+  s_call       = st;
+  Serial.printf("<< CUOC GOI %s: %s%s%s%s\n", peer[0] ? peer : "?", state,
+                reason[0] ? " (" : "", reason, reason[0] ? ")" : "");
+}
+
+static bool liveSend(const uint8_t *jpg, size_t len) {
+  return sessionLiveFrame(jpg, len, 2000);
+}
+
+static void onPlayed(const char *turn, unsigned long firstByteMs, unsigned long firstAudioMs) {
+  sessionPlayed(turn, firstByteMs ? firstByteMs : firstAudioMs, firstAudioMs);
+}
+
+void startSession() {
+  SessionHandlers h = {};
+  h.onReady    = hReady;
+  h.onDown     = hDown;
+  h.onReply    = hReply;
+  h.onAudio    = hAudio;
+  h.onReplyEnd = hReplyEnd;
+  h.onHazard   = hHazard;
+  h.onCue      = hCue;
+  h.onCam      = hCam;
+  h.onCapture  = hCapture;
+  h.onLiveEnd  = hLiveEnd;
+  h.onError    = hError;
+  h.onCallState = hCallState;
+  sessionBegin(h);
 }
 
 // ============================================================================
-// Vong doi mot lan nhan nut
+// Mot luot hoi
 // ============================================================================
-// Giu nguyen trinh tu cua audioTask, chi thay dieu kien thu am
-// ============================================================================
-void audioSimulatePress(unsigned long holdMs) {
-  perfBegin("GIA LAP MOT LAN BAM NUT");
-  Serial.printf("\n===== GIA LAP BAM NUT (%lu ms) =====\n", holdMs);
+static bool btnDown() { return digitalRead(BTN) == BTN_ACTIVE; }
 
-  // Giong het duong bam nut that: mo TLS truoc tien, chay song song.
-  apiBegin();
+// Luc nut nha han lan truoc. Bam lai som hon PRESS_GAP_MS thi chua tinh — xem
+// waitRelease().
+static unsigned long s_releasedAt = 0;
+static const unsigned long PRESS_GAP_MS = 250;
 
+// Ham dung cua playerPump(): nguoi dung bam nut, socket vua rot, hoac cuoc goi
+// vua noi may (server da tu dung moi cau dang doc — muc 16.2).
+static bool stopPlayback() {
+  return btnDown() || s_dropAll || (s_call == CALL_ACTIVE && !s_hangupSent);
+}
+
+static void waitRelease() {
+  // 🔴 Vong nay TUNG khong co gioi han. Khi chan nut chap xuong GND that thi no
+  // cho vinh vien: thiet bi cam tit, khong log gi, nhin giong hong hoan toan.
+  const unsigned long STUCK_MS = 15000;
+  unsigned long t = millis();
+  // 🔴 "Da nha" = nut o muc cao LIEN TUC RELEASE_STABLE_MS, khong phai mot lan
+  // doc. Do that tren board (2026-10-20): 5 luot trong 1.5 s, moi luot thu
+  // 0-500 ms — nut doi luc nha, moi lan doi la mot turn_start moi, an vao tran
+  // 30 luot/phut cua server.
+  const unsigned long RELEASE_STABLE_MS = 60;
+  unsigned long tHigh = 0;
+  for (;;) {
+    if (btnDown()) {
+      tHigh = 0;
+      if (millis() - t > STUCK_MS) {
+        Serial.printf("LOI PHAN CUNG: GPIO%d o muc thap lien tuc %lu s.\n",
+                      BTN, STUCK_MS / 1000);
+        Serial.println("Nut bi ket, chap, hoac day tin hieu cham GND.");
+        break;
+      }
+    } else {
+      if (!tHigh) tHigh = millis();
+      if (millis() - tHigh >= RELEASE_STABLE_MS) break;
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+  s_releasedAt = millis();
+}
+
+static void newTurnId(char *out, size_t cap) {
+  // Kinh tu sinh id (muc 3). Ghep mot tem ngau nhien luc khoi dong de id cua
+  // lan bat may truoc khong trung id cua lan nay trong metrics cua server.
+  static uint16_t boot = (uint16_t)esp_random();
+  static uint32_t n = 0;
+  snprintf(out, cap, "t%04x-%lu", boot, (unsigned long)++n);
+}
+
+static void runTurn(bool simulated, unsigned long holdMs) {
+  perfBegin(simulated ? "GIA LAP MOT LUOT" : "MOT LUOT BAM NUT");
+  Serial.println(simulated ? "\n===== GIA LAP BAM NUT =====" : "\n===== BAM NUT =====");
+
+  // Muc 1, buoc 7: dung moi thu dang phat. Server cung bo cau dang doc khi
+  // nhan turn_start (muc 4.2), nen phan con trong hang la phan bo di.
+  pqFlush();
+  liveOnPress();
+
+  if (!sessionReady()) {
+    Serial.println("Chua co phien voi server — keu loi, thu mo lai ngay");
+    // Bam nut la nguoi dung chu dong — ke ca sau 4000/4401 cung thu lai.
+    sessionKick();
+    cueError();
+    if (!simulated) waitRelease();
+    return;
+  }
+
+  // Bo dem anh + tieng cua luot truoc phai xong viec tren duong len.
+  if (!sessionUplinkIdle()) {
+    unsigned long t = millis();
+    while (!sessionUplinkIdle() && millis() - t < UPLINK_WAIT_MS)
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+    if (!sessionUplinkIdle()) {
+      Serial.println("Duong len van con ban voi luot truoc — bo luot nay");
+      cueError();
+      if (!simulated) waitRelease();
+      return;
+    }
+    Serial.printf("Doi luot truoc day xong %lu ms\n", millis() - t);
+  }
+
+  char turn[24];
+  newTurnId(turn, sizeof(turn));
+  unsigned long tPress = millis();
+
+  strncpy(s_curTurn, turn, sizeof(s_curTurn) - 1);
+  strncpy(s_waitTurn, turn, sizeof(s_waitTurn) - 1);
+  s_gotReply = false;
+  s_rejected = false;
+  s_lost     = false;
+  // 🔴 Bat co cho NGAY TU DAY, khong doi toi sau turn_end. Do that tren board
+  // (2026-10-20): server tra `reply` ~200 ms sau turn_end — nhanh hon luc task
+  // audio in xong bang thoi gian + bo nho roi moi bat co. Reply toi luc co con
+  // tat thi hReply() khong ghi nhan, va 15 s sau kinh keu loi oan du da phat
+  // xong cau tra loi. Dong ho 15 s van chi tinh tu turn_end (o duoi).
+  s_waitSince = millis();
+  s_waiting   = true;
+  sessionTurnStart(turn, tPress);
+  perfMark("turn_start");
+
+  // 1. Chup TRUOC khi thu: anh phai la khoanh khac bam, khong phai luc nha.
   bool havePhoto = photoCapture();
   perfMark("chup anh");
 
-  // Giao anh ngay — no se duoc day len trong luc dang thu tieng.
-  if (havePhoto) apiPushImage(photoData(), photoSize());
+  // 2. Giao anh NGAY (muc 12, buoc 3) — no di len trong luc nguoi dung dang noi.
+  // Da nha nut truoc khi chup xong thi day la cu bam KHONG noi (= "dung" khi
+  // dang phat nhac / chi duong, muc 5.5): khong can anh, tiet kiem duong len.
+  bool held = simulated || btnDown();
+  if (havePhoto && held) sessionImage(photoData(), photoSize());
+  else if (!havePhoto)   Serial.println("Khong co anh — luot nay chi co tieng");
 
-  // Mo phan tieng roi thu — nen va day dan trong luc thu, giong het duong
-  // bam nut that. Duong gia lap phai la CUNG mot duong, khong thi con so do
-  // duoc o day khong noi gi ve duong that.
+  // 3. Thu va day tieng THEO LUONG (muc 1, buoc 9).
   encodeBegin();
-  apiAudioOpen(sendBuf, "record.adpcm", g_audType);
+  sessionAudioOpen(sendBuf);
+  size_t pcmBytes = 0;
+  if (simulated)  pcmBytes = recordFixed(holdMs, onRecChunk);
+  else if (held)  pcmBytes = recordWhileHeld(onRecChunk);
+  perfMark("thu am + nen + day");
 
-  size_t pcmBytes = recordFixed(holdMs, onRecChunk);
-  perfMark("thu am + nen + day song song");
+  if (!simulated) waitRelease();
+  perfMark("cho nha nut");
 
-  if (!havePhoto) {
-    Serial.println("Khong co anh — bo qua lan nay");
-    apiAbort();
-    return;
-  }
-  if (pcmBytes == 0) {
-    Serial.println("Khong thu duoc gi — bo qua lan nay");
-    apiAbort();
-    photoRelease();
-    return;
-  }
+  // 🔴 Cu bam ngan KHONG bi bo nhu truoc (MIN_MS). Voi server nay "bam khong
+  // noi" la mot lenh that — dung nhac, dung chi duong (muc 5.5) — nen van phai
+  // turn_end du khong co tieng nao.
+  encodeFinish(pcmBytes);
+  bool ended = sessionTurnEnd(turn, millis());
+  perfMark("turn_end");
 
-  size_t audBytes = encodeFinish(pcmBytes);
-  perfMark("nen + day khoi cuoi");
-
-  bool ok = false;
-  if (audBytes == 0) {
-    Serial.println("Khong nen duoc ban thu — bo qua lan nay");
-    apiAbort();
-  } else if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Chua co WiFi — khong gui duoc");
-    apiAbort();
-  } else {
-    cueSent();
-    perfMark("keu tieng da nhan");
-    ok = waitAndPlay();
-  }
   dspStreamReport(pcmBytes / sizeof(int16_t));
-  if (!ok) cueError();
 
-  photoRelease();
+  if (!ended) {
+    s_waiting = false;
+    Serial.println("Mat phien giua luot — keu loi");
+    cueError();
+  } else {
+    s_waitSince = millis();
+  }
   perfReport();
-  memReport("sau lan gia lap");
+  memReport("sau mot luot");
+  // Anh KHONG tra o day: task mang co the van dang day no. photoCapture() cua
+  // luot sau tu tra, va luot sau chi chup khi duong len da ranh (o tren).
+}
+
+void audioSimulatePress(unsigned long holdMs) {
+  runTurn(true, holdMs);
 }
 
 // ============================================================================
+// Cuoc goi (FIRMWARE_ENDPOINTS muc 16)
+// ============================================================================
+// Bam nut khi dang co cuoc goi: KHONG phai mot luot hoi. Server bo qua
+// turn_start khi ringing_out/active, nen gui turn_start luc nay chi lam nguoi
+// dung tuong may lien.
+static void onCallPress() {
+  pqFlush();                  // dung cau "Me dang goi. Bam nut de nghe." dang doc
+  char id[64];
+  portENTER_CRITICAL(&s_callMux);
+  memcpy(id, s_callId, sizeof(id));
+  portEXIT_CRITICAL(&s_callMux);
+
+  if (!sessionReady()) {
+    sessionKick();
+    cueError();
+  } else if (s_call == CALL_RING_IN) {
+    Serial.println("\n===== BAM NUT: NGHE MAY =====");
+    sessionCallAnswer(id);
+  } else {
+    // ringing_out (ke ca chuoi khan cap) hoac active: cup / huy.
+    Serial.println("\n===== BAM NUT: CUP MAY =====");
+    s_hangupAt   = millis();
+    s_hangupSent = true;
+    sessionCallHangup(id);
+  }
+  waitRelease();
+}
+
+// Vong song cong: moi vong doc DUNG mot khoi mic (~31.6 ms, nhip cua ca vong),
+// nen + gui 0x05, roi phat DUNG mot khoi tieng dau kia. Chay toi khi cuoc goi
+// het, nguoi dung bam cup, hoac socket rot.
+//
+// Lenh Serial KHONG chay trong luc goi: lenh chan doan dung chung recBuf[] va
+// I2S voi vong nay.
+//
+// 🔴 Chua co khu vong (AEC): mic nghe ca tieng loa, nen dau kia nghe lai giong
+// minh tre ~0.3-0.5 s. Spec muc 16.4 cung ghi AEC "chua kiem".
+static void runCall() {
+  Serial.println("\n===== DANG GOI =====");
+  pqFlush();                  // server da dung moi cau dang doc (muc 16.2)
+  livePause(true);            // muc 16.2: ngung 0x04 khi active
+
+  // sendBuf lam vong mic. Luot hoi truoc (neu con) phai day xong truoc.
+  unsigned long t = millis();
+  while (!sessionUplinkIdle() && millis() - t < 1000)
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+
+  adpcmEncReset(g_enc);
+  dspStreamBegin();
+  sessionCallMicOpen(sendBuf, sendCap);
+  playerCallBegin();
+
+  uint8_t       out[ADPCM_BLOCK_BYTES];
+  uint32_t      sent = 0, dropped = 0;
+  bool          pressed = false;
+  unsigned long t0 = millis();
+
+  while (s_call == CALL_ACTIVE && !s_hangupSent && sessionReady() && !s_dropAll) {
+    if (btnDown() && millis() - s_releasedAt >= PRESS_GAP_MS) {
+      vTaskDelay(30 / portTICK_PERIOD_MS);      // loc nhieu nut; DMA loa con ~240 ms
+      if (btnDown()) { pressed = true; break; }
+    }
+    size_t n = recordBlock(recBuf, ADPCM_BLOCK_SAMPLES);
+    if (n) {
+      dspStreamPrep(0, n);
+      size_t b = adpcmEncodeBlock(g_enc, recBuf, n, out);
+      if (sessionCallMicPush(out, b)) sent++;
+      else                            dropped++;
+    }
+    playerCallStep();
+  }
+
+  sessionCallMicClose();
+  playerCallEnd();
+  livePause(false);
+  Serial.printf("Het vong goi sau %lu s: mic %u khoi, bo %u khoi\n",
+                (millis() - t0) / 1000, (unsigned)sent, (unsigned)dropped);
+
+  // Cup SAU khi da tra loa: giu nut ma loa con mo thi DMA can va re.
+  if (pressed) onCallPress();
+}
+
+// ============================================================================
+static void checkReplyWait() {
+  if (!s_waiting) return;
+  if (s_gotReply || s_rejected) { s_waiting = false; return; }
+  if (s_lost) {
+    s_waiting = false;
+    Serial.println("Socket rot khi dang cho tra loi — bam lai sau khi noi lai");
+    cueError();
+    return;
+  }
+  if (millis() - s_waitSince > REPLY_TIMEOUT_MS) {
+    s_waiting = false;
+    Serial.printf("Qua %lu s khong co reply cho %s — keu loi\n",
+                  REPLY_TIMEOUT_MS / 1000, s_waitTurn);
+    cueError();
+  }
+}
+
+static void maybeRestart() {
+#if RESTART_ON_TLS_STARVE
+  if (sessionReady() || sessionFailStreak() < RESTART_FAILS) return;
+  if (s_waiting || playerActive() || !pqEmpty() || s_call != CALL_NONE) return;
+  if (WiFi.status() != WL_CONNECTED) return;      // mang hong thi restart vo ich
+  size_t big = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (big >= TLS_MIN_BLOCK) return;
+  Serial.printf("TLS hong %u lan lien, khoi lien RAM noi %u B < %u B — khoi dong lai\n",
+                (unsigned)sessionFailStreak(), (unsigned)big, (unsigned)TLS_MIN_BLOCK);
+  delay(200);
+  ESP.restart();
+#endif
+}
+
 static void audioTask(void *arg) {
   for (;;) {
     // Lenh chan doan qua Serial. Xem serial_console.h.
     consolePoll();
 
-    if (digitalRead(BTN) != BTN_ACTIVE) {
-      vTaskDelay(20 / portTICK_PERIOD_MS);      // vTaskDelay, KHONG delay()
-      continue;
-    }
-    vTaskDelay(50 / portTICK_PERIOD_MS);        // debounce
-    if (digitalRead(BTN) != BTN_ACTIVE) continue;
+    if (s_dropAll) { s_dropAll = false; pqFlush(); }
 
-    unsigned long tPress = millis();
-    perfBegin("MOT LAN BAM NUT");
-    Serial.println("\n===== BAM NUT =====");
-
-    // 0. Mo TLS NGAY BAY GIO, chay song song o core 0.
-    //
-    // 🔴 Dat truoc ca viec chup anh, va la dong dau tien cua mot lan bam. Do
-    // that tren hotspot 4G: bat tay TCP+TLS toi Cloudflare mat 7-8 giay. Neu
-    // doi toi luc nha nut moi mo thi nguoi dung ngoi cho tron 8 giay do. Con
-    // o day thi no chay lut trong khoang chup anh + thu tieng — luc nha nut
-    // duong da san, chi con viec do byte ra.
-    //
-    // Ham tra ve tuc thi, khong lam cham viec chup mot mili giay nao.
-    apiBegin();
-
-    // 1. Chup TRUOC khi thu: anh phai la khoanh khac bam, khong phai luc nha.
-    bool havePhoto = photoCapture();
-    perfMark("chup anh");
-
-    // 2. Giao anh cho task mang NGAY, dung doi thu xong.
-    //
-    // 🔴 Day la chang an tien nhat cua ca luong. Duong day len do duoc chi
-    // 5.9-9 KB/s; buc anh 720p khoang 60 KB, tuc bay giay. Nhung nguoi dung
-    // dang giu nut va dang noi — bay giay do la thoi gian chet, du de day het
-    // anh. Doi nha nut roi moi gui thi bay giay do cong THANG vao khoang
-    // nguoi dung ngoi cho.
-    //
-    // photoData() phai con song toi khi apiWaitReply() tra ve: task mang doc
-    // thang tu PSRAM, khong sao chep. Vi vay photoRelease() nam o cuoi vong.
-    if (havePhoto) apiPushImage(photoData(), photoSize());
-
-    // 2b. Mo phan tieng cua multipart NGAY BAY GIO, truoc khi co byte nao.
-    //
-    // 🔴 Day la chang thay doi ca cam giac dung may. Truoc kia ban thu chi bat
-    // dau di sau khi nha nut, va 26 KB ADPCM tren hotspot 9 KB/s la gan 3 giay
-    // ngoi im. Gio moi 505 mau (32 ms) sinh ra mot khoi 256 byte va di ngay,
-    // nen luc nha nut chi con dung MOT khoi phai day — duoi 0.2 giay tren moi
-    // duong truyen.
-    encodeBegin();
-    apiAudioOpen(sendBuf, "record.adpcm", g_audType);
-
-    // 3. Thu cho toi khi nha nut. onRecChunk() loc + nen + giao cho task mang
-    // ngay giua hai lan doc mic.
-    size_t pcmBytes = recordWhileHeld(onRecChunk);
-    perfMark("thu am + nen + day song song");
-
-    // Doi nut nha han (truong hop cham tran MAX_SECS).
-    //
-    // 🔴 Vong nay TUNG khong co gioi han. Khi chan nut chap xuong GND that,
-    // digitalRead luon tra BTN_ACTIVE nen no cho vinh vien: thiet bi cham
-    // tran 10 giay roi cam tit, khong log gi them, nhin ben ngoai giong hong
-    // hoan toan. Mot su co phan cung 1 dong day khong duoc phep bien thanh
-    // treo im lang — phai keu len.
-    {
-      const unsigned long STUCK_MS = 15000;
-      unsigned long tRel = millis();
-      while (digitalRead(BTN) == BTN_ACTIVE) {
-        if (millis() - tRel > STUCK_MS) {
-          Serial.printf("LOI PHAN CUNG: GPIO%d o muc thap lien tuc %lu s.\n",
-                        BTN, STUCK_MS / 1000);
-          Serial.println("Nut bi ket, chap, hoac day tin hieu cham GND. "
-                         "Kiem tra day nut — phan mem khong chay tiep duoc.");
-          break;
-        }
-        vTaskDelay(20 / portTICK_PERIOD_MS);
+    if (btnDown() && millis() - s_releasedAt >= PRESS_GAP_MS) {
+      vTaskDelay(30 / portTICK_PERIOD_MS);      // loc nhieu nut
+      if (btnDown()) {
+        if (s_call != CALL_NONE) onCallPress();
+        else                     runTurn(false, 0);
+        continue;
       }
     }
-    // Chang nay PHAI bang ~0. Khac 0 nghia la recordWhileHeld() da tra ve som
-    // hon luc nha tay — tuc la cham tran MAX_SECS, cau hoi bi cat cut.
-    perfMark("cho nha nut");
 
-    // Bo qua lan bam thi phai bo luon lan gui dang do, neu khong socket nam
-    // do om ~45 KB heap cho toi lan bam sau — ma lan bam sau lai xin mo mot
-    // cai moi, nen cho nay tung la duong ro ri cham.
-    if (millis() - tPress < MIN_MS || pcmBytes == 0) {
-      Serial.println("Nhan qua ngan — bo qua");
-      apiAbort();
-      photoRelease();
-      continue;
-    }
-    if (!havePhoto) {
-      Serial.println("Khong co anh — bo qua lan nay");
-      apiAbort();
+    if (s_call == CALL_ACTIVE && !s_hangupSent && sessionReady()) {
+      runCall();
       continue;
     }
 
-    // Chi con phan le chua du mot khoi. Chang nay PHAI gan bang 0 — day la
-    // con so tra loi cau hoi "nha nut xong bao lau thi request di het".
-    size_t audBytes = encodeFinish(pcmBytes);
-    perfMark("nen + day khoi cuoi");
+    // Phat moi thu dang co. Tra ve ngay khi hang rong; bam nut thi tra ve
+    // ngay — vong sau bat duoc nut va mo luot moi.
+    playerPump(stopPlayback);
 
-    // 4. Keu tieng bao da nhan. Luc nay byte cuoi da nam trong tay task mang
-    // roi (encodeFinish o tren), nen cueSent() chiem core 1 mat ~0.94 giay
-    // khong lam cham duong truyen mot mili giay nao — hai viec chay o hai core.
-    bool ok = false;
-    if (audBytes == 0) {
-      Serial.println("Khong nen duoc ban thu — bo qua lan nay");
-      apiAbort();
-    } else if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("Chua co WiFi — khong gui duoc");
-      apiAbort();
-    } else {
-      cueSent();
-      perfMark("keu tieng da nhan");
-
-      // 4. Cho header roi vua nhan vua phat — khong doi tron file.
-      ok = waitAndPlay();
-    }
-
-    // In cac con so cua ban thu SAU khi da gui xong: chung chi de nguoi doc
-    // log biet mic thu duoc gi, khong con anh huong toi byte di len server.
-    dspStreamReport(pcmBytes / sizeof(int16_t));
-
-    // Moi duong hong deu phai keu len. Nguoi dung khong nhin man hinh: neu im
-    // lang thi "dang cho server" va "hong tu dau, bam lai di" nghe giong het
-    // nhau, va ho se dung do rat lau truoc khi doan ra.
-    if (!ok) cueError();
-
-    photoRelease();
-    perfReport();
-    memReport("sau mot lan bam nut");
+    checkReplyWait();
+    maybeRestart();
+    vTaskDelay(10 / portTICK_PERIOD_MS);        // vTaskDelay, KHONG delay()
   }
 }
 
@@ -449,15 +615,8 @@ static void audioTask(void *arg) {
 bool startAudio() {
   pinMode(BTN, INPUT_PULLUP);
 
-  // Ghep nhan Content-Type tu chinh hai hang so ma bo nen dang dung, de no
-  // khong the lech voi byte that su di len day.
-  snprintf(g_audType, sizeof(g_audType),
-           "audio/x-adpcm-ima; rate=%u; channels=1; block=%u",
-           (unsigned)SR, (unsigned)ADPCM_BLOCK_BYTES);
-
   // Nut khong duoc phep dang bam luc khoi dong. Neu doc ra dang bam thi gan
-  // nhu chac chan la chap day, va neu khong bao o day thi trieu chung se la
-  // "may tu chup tu thu roi treo" — rat kho lan ra nguyen nhan.
+  // nhu chac chan la chap day.
   delay(5);                     // cho dien tro keo len on dinh
   if (digitalRead(BTN) == BTN_ACTIVE) {
     Serial.printf("CANH BAO: GPIO%d dang o muc thap NGAY LUC KHOI DONG.\n", BTN);
@@ -467,20 +626,20 @@ bool startAudio() {
 
   flashLedBegin();
 
-  // 🔴 Hai moc nay (truoc/sau khi cap phat audio) la so lieu goc de tra loi
-  // "co nhet them duoc WakeNet khong". Cot quyet dinh la KHOI LIEN LON NHAT
-  // cua RAM NOI — AFE cua esp-sr xin RAM noi, khong xin PSRAM.
   memReport("truoc khi cap phat audio");
 
   if (!audioBuffersAlloc()) return false;
+  pqBegin(stageBuf, stageCap);
 
   if (!i2sBegin()) {
     audioBuffersFree();         // tra lai vai tram KB cho camera
     return false;
   }
 
-  // Stack 12 KB: bat tay TLS cua mbedtls mot minh da an ~8 KB.
-  // Ghim core 1: core 0 dang lo WiFi/TCP. Priority 1 = duoi httpd.
+  playerSetPlayedHandler(onPlayed);
+  liveBegin(liveSend);
+
+  // Ghim core 1: core 0 dang lo Wi-Fi/TCP + task wssess. Priority 1 = duoi httpd.
   if (xTaskCreatePinnedToCore(audioTask, "audio", 12288, NULL, 1, NULL, 1) != pdPASS) {
     Serial.println("Khong tao duoc task audio");
     audioBuffersFree();
@@ -489,9 +648,8 @@ bool startAudio() {
 
   memReport("sau khi cap phat audio — day la muc nen thuc te");
 
-  Serial.printf("Audio san sang (toi da %u giay/lan).\n",
+  Serial.printf("Audio san sang (toi da %u giay/luot).\n",
                 (unsigned)(recMaxSamp / SR));
-  Serial.printf("Giu nut GPIO%d de chup + thu.\n", BTN);
-  Serial.println("Go 'c' de chup thu, 'r' de xem bo nho con lai.");
+  Serial.printf("Giu nut GPIO%d de chup + thu. Go 'v' xem phien, 'r' xem bo nho.\n", BTN);
   return true;
 }

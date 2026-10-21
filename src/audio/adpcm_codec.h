@@ -6,7 +6,7 @@
 // ============================================================================
 // Khoi nay chi bien doi so: PCM 16-bit <-> nibble 4-bit. No KHONG dung toi
 // phan cung, KHONG cap phat, KHONG biet gi ve HTTP hay I2S. Ai goi thi tu lo
-// bo dem va tu dong header WAV (audio_format.*).
+// bo dem; header WAV (neu can) la viec cua ben goi.
 //
 // Vi sao ADPCM chu khong phai MP3/Opus:
 //   - Bang thong tut 4 lan (16 kHz mono: 32 KB/s -> 8 KB/s) ma gia phai tra

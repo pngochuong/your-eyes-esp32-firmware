@@ -5,9 +5,9 @@
 // nam trong src/, moi thu muc mot viec:
 //
 //   src/camera/  bat camera, nap profile cam bien, chup anh de gui
-//   src/net/     Wi-Fi, doc than HTTP, POST anh + tieng len server
+//   src/net/     Wi-Fi, phien WebSocket /v2/session voi server
 //   src/web/     web server xem truc tiep va chinh cam bien
-//   src/audio/   I2S, thu mic, xu ly tin hieu, giai ma MP3, phat ra loa
+//   src/audio/   I2S, thu mic, nen/giai ADPCM, hang phat, phat ra loa
 //   src/diag/    cac lenh chan doan go qua Serial
 //   src/util/    tien ich chung
 //
@@ -21,7 +21,6 @@
 #include "src/audio/audio_service.h"
 #include "src/camera/camera_device.h"
 #include "src/camera/camera_tuning.h"
-#include "src/net/api_client.h"
 #include "src/net/wifi_manager.h"
 #include "src/web/web_led.h"
 #include "src/web/web_server.h"
@@ -35,8 +34,8 @@
 //
 // Ten mang phan biet chu hoa chu thuong va tinh ca dau cach. Mang mo (khong
 // mat khau) thi de mat khau la chuoi rong "".
-const char* WIFI_SSID     = "UIT Public";
-const char* WIFI_PASSWORD = "";
+const char* WIFI_SSID     = "Thanh_Cuong_FI";
+const char* WIFI_PASSWORD = "123456789";
 // ===========================================================================
 
 void setup() {
@@ -60,30 +59,18 @@ void setup() {
   // va loop() ben duoi se tu ket noi lai khi song quay ve.
   bool wifiOk = wifiConnect(30000);
 
+  // 🔴 Mo phien WS NGAY BAY GIO, truoc startCameraServer() va startAudio().
+  // mbedtls can ~45 KB RAM noi LIEN; sau khi httpd + audio lay phan cua chung
+  // thi khoi lien lon nhat da do duoc chi con 31-35 KB. Phien nay duoc GIU suot,
+  // nen day la lan bat tay duy nhat trong ca doi may — phai cho no luc RAM con
+  // thoang nhat.
+  //
+  // "Bat nguon la chay": khong co nut bat, khong cho ai bam gi — co dien la
+  // kinh tu noi Wi-Fi, tu mo phien, tu noi lai khi rot. Mat Wi-Fi luc nay cung
+  // goi: task phien tu cho mang roi tu noi.
+  startSession();
+
   if (wifiOk) {
-    // 🔴 Lay dia chi ma wifiConnect() DA bat tay TLS tron ven toi, chu khong
-    // hoi DNS lai. Do that (2026-08-18): cung mot ten mien, dia chi
-    // 104.21.67.134 bat tay xong trong 3212 ms, con 172.67.176.233 bat tay TCP
-    // xong nhung TLS thi treo vinh vien — 15 giay cung khong xong. Cloudflare
-    // tra nhieu IP va khong phai duong nao cung cho qua goi full-size. Hoi lai
-    // DNS la tu nguyen doi mot dia chi da co bang chung lay mot dia chi chua
-    // biet gi.
-    //
-    // apiResolve() chi con la duong lui khi phep thu kia khong ket luan duoc.
-    IPAddress srvIp;
-    if (wifiProvenServerIp(srvIp)) apiSetAddress(srvIp);
-    else                           apiResolve(true);
-
-    // 🔴 Bat tay TLS NGAY BAY GIO, truoc startCameraServer(). Hai ly do, ca hai
-    // deu do duoc:
-    //   - RAM noi luc nay thoang nhat ca phien. mbedtls can ~45 KB LIEN, va sau
-    //     khi httpd + audio da lay phan cua chung thi khoi lien lon nhat tut tu
-    //     147 KB xuong 106 KB.
-    //   - Phien nay duoc GIU lai (TLS_KEEPALIVE_MS), nen lan bam nut dau tien
-    //     khong phai bat tay — chang dat nhat cua ca luong bang 0 ngay tu dau,
-    //     chu khong phai tu lan bam thu hai.
-    apiWarmUp();
-
     startCameraServer();
 
     Serial.println();
@@ -104,9 +91,9 @@ void setup() {
 }
 
 void loop() {
-  // Web server va camera chay trong task rieng, audio chay trong task
-  // "audio" ghim o core 1. Loop chi con viec trong chung Wi-Fi: rot mang
-  // giua chung thi task audio khong POST duoc, nen phai noi lai.
+  // Web server va camera chay trong task rieng, audio o task "audio" (core 1),
+  // phien WS o task "wssess" (core 0) — task do tu noi lai socket khi Wi-Fi ve.
+  // Loop chi con viec trong chung Wi-Fi.
   static bool serverStarted = (WiFi.status() == WL_CONNECTED);
 
   if (!cameraIsReady()) {
@@ -118,28 +105,15 @@ void loop() {
     Serial.println("Mat WiFi — dang ket noi lai...");
     WiFi.disconnect();
 
-    if (wifiConnect(20000)) {
-      // Dia chi cu thuoc ve mang cu. Lay lai dia chi vua duoc chung minh tren
-      // mang MOI, dung doi toi lan bam nut moi phat hien ra.
-      IPAddress srvIp;
-      if (wifiProvenServerIp(srvIp)) apiSetAddress(srvIp);
-      else                           apiResolve(true);
-      apiWarmUp();
+    if (wifiConnect(20000) && !serverStarted) {
+      // Lan dau vao duoc mang sau khi setup() that bai: gio moi co IP
+      // de web server bind vao.
+      startCameraServer();
+      serverStarted = true;
 
-      if (!serverStarted) {
-        // Lan dau vao duoc mang sau khi setup() that bai: gio moi co IP
-        // de web server bind vao.
-        startCameraServer();
-        serverStarted = true;
-
-        Serial.print("Mo trinh duyet: http://");
-        Serial.println(WiFi.localIP());
-      }
+      Serial.print("Mo trinh duyet: http://");
+      Serial.println(WiFi.localIP());
     }
-  } else {
-    // Mang van tot: chi lam moi dia chi khi no da cu. apiResolve() tu bo qua
-    // neu con han, nen goi moi 10 giay o day khong ton gi.
-    apiResolve(false);
   }
 
   delay(10000);

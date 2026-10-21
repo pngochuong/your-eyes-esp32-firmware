@@ -4,11 +4,17 @@
 // ============================================================================
 // Lenh chan doan go qua Serial
 // ============================================================================
+//   =<token> — nap token cua kinh vao NVS (khong in ra), roi mo lai phien
+//   v — trang thai phien WebSocket
+//   p — gia lap mot luot giu nut 3 giay
+//   b — nghe thu tieng bao loi
 //   c — chup thu, do do net (khong gui di dau)
 //   m — so sanh hai cach ghi khe I2S
 //   t — thu loa bang song sin va do meo tieng
-//   w — kiem tra duong mang: WiFi -> DNS -> TCP/TLS
+//   w — kiem tra duong mang: WiFi -> DNS -> TCP/TLS, roi in trang thai phien
+//   s — quet song Wi-Fi
 //   n — do nen nhieu khi camera bat va khi camera tat
+//   r — in bo nho con lai
 //
 // 🔴 Tung co them che do chinh net ong kinh ('f') chay vong lap o day.
 // Da BO: vong do chi thoat khi co ky tu Serial moi, nen no CHAN LUON

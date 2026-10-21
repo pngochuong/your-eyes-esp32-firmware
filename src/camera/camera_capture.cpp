@@ -1,5 +1,6 @@
 #include "camera_capture.h"
 
+#include "camera_device.h"
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "../util/mem_alloc.h"
@@ -115,6 +116,8 @@ static uint8_t *burstBest(size_t *outLen, uint16_t *outW, uint16_t *outH,
   uint8_t *bestBuf = NULL;
   size_t   best = 0, worst = (size_t)-1;
 
+  // Khung hong ngay sau luc live doi do phan giai da duoc cameraSetMode() bo
+  // san — xem ghi chu o do.
   for (int i = 1; i <= CAPTURE_TRIES; i++) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
@@ -172,6 +175,11 @@ static uint8_t *burstBest(size_t *outLen, uint16_t *outW, uint16_t *outH,
 bool photoCapture() {
   photoRelease();
 
+  // Live (OCR / chi duong) co the dang giu camera o do phan giai khac. Khoa
+  // lai va dat ve HD; live tu dat lai che do cua no o khung ke tiep.
+  cameraLock();
+  cameraUseDefault();
+
   flashLed(true);
 #if FLASH_LED_PIN >= 0
   vTaskDelay(FLASH_SETTLE_MS / portTICK_PERIOD_MS);
@@ -183,6 +191,7 @@ bool photoCapture() {
   uint8_t *buf = burstBest(&len, &w, &h, &spread);
 
   flashLed(false);          // tat truoc khi thu am
+  cameraUnlock();
 
   if (!buf) {
     Serial.println("Khong chup duoc khung nao");
@@ -191,6 +200,9 @@ bool photoCapture() {
 
   jpg    = buf;
   jpgLen = len;
+  // In kich thuoc THAT trong JPEG, khong phai kich thuoc driver bao — hai so
+  // nay lech nhau ngay sau khi live doi do phan giai (xem cameraSetMode()).
+  jpegSize(buf, len, &w, &h);
   Serial.printf("Chup xong: %ux%u, %u byte (chenh lech loat %u%%)\n",
                 (unsigned)w, (unsigned)h, (unsigned)len, spread);
   return true;
